@@ -877,7 +877,7 @@ int main(int argc, char *argv[]) {
     printf(
         "GoodbyeDPI " GOODBYEDPI_VERSION
         ": Passive DPI blocker and Active DPI circumvention utility\n"
-        "https://github.com/ValdikSS/GoodbyeDPI\n\n"
+        "https://github.com/0mori1/GoodbyeDPI, Fork of https://github.com/ValdikSS/GoodbyeDPI\n\n"
     );
 
     if (argc == 1) {
