@@ -986,8 +986,21 @@ int main(int argc, char *argv[]) {
             case 'l':
                 nullify_host = 1;
                 break;
-            case 'd': 
-                raise_totallength = 1;
+            case 'd': // --dns-addr
+                if ((inet_pton(AF_INET, optarg, dns_temp_addr.s6_addr) == 1) &&
+                    !do_dnsv4_redirect)
+                {
+                    do_dnsv4_redirect = 1;
+                    if (inet_pton(AF_INET, optarg, &dnsv4_addr) != 1) {
+                        puts("DNS address parameter error!");
+                        exit(ERROR_DNS_V4_ADDR);
+                    }
+                    add_filter_str(IPPROTO_UDP, 53);
+                    flush_dns_cache();
+                    break;
+                }
+                puts("DNS address parameter error!");
+                exit(ERROR_DNS_V4_ADDR);
                 break;
             case 'f':
                 do_fragment_http = 1;
