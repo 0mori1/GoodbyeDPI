@@ -1,5 +1,7 @@
-<span style="color:red">DO NOT USE ON METERED NETWORKS!</span>
+DO NOT USE ON METERED NETWORKS!
 Not for an extended period of time, at least.
+
+And by the way, this tool is powerless against IP blocks. Sorry.
 
 This is a fork of ValdikSS' goodbyeDPI, I'm too lazy to make a proper readme, so just see the usage guide shown to you when you use the --help flag.
 
