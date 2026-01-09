@@ -18,10 +18,14 @@
 #include "service.h"
 #include "dnsredir.h"
 #include "ttltrack.h"
-#include "blackwhitelist.h"
+#include "blackwhitelist.h" 
 #include "fakepackets.h"
-#include <pthread.h>
+#include <pthread.h>    
+#include <windows.h>    
 #define MAX_PACKET_SIZE 2048
+#define SHOWSNI
+#define FATASSMAXLIFE 256
+#define OBSERVATION
 // My mingw installation does not load inet_pton definition for some reason
 WINSOCK_API_LINKAGE INT WSAAPI inet_pton(INT Family, LPCSTR pStringBuf, PVOID pAddr);
 
@@ -64,6 +68,7 @@ WINSOCK_API_LINKAGE INT WSAAPI inet_pton(INT Family, LPCSTR pStringBuf, PVOID pA
 /* #IPID# is a template to find&replace */
 #define IPID_TEMPLATE "#IPID#"
 #define MAXPAYLOADSIZE_TEMPLATE "#MAXPAYLOADSIZE#"
+#ifndef DOLOCALNETS
 #define FILTER_STRING_TEMPLATE \
         "(tcp and !impostor and !loopback " MAXPAYLOADSIZE_TEMPLATE " and " \
         "((inbound and (" \
@@ -73,21 +78,45 @@ WINSOCK_API_LINKAGE INT WSAAPI inet_pton(INT Family, LPCSTR pStringBuf, PVOID pA
            ") and " \
            "tcp.SrcPort == 80 and tcp.Ack" \
           ") or " \
-          "((tcp.SrcPort == 80 or tcp.SrcPort == 443) and tcp.Ack and tcp.Syn)" \
+          "((tcp.SrcPort == 80 or tcp.SrcPort == 443) and ((tcp.Ack and tcp.Syn) or tcp.Ack))" \
          ")" \
          " and (" DIVERT_NO_LOCALNETSv4_SRC " or " DIVERT_NO_LOCALNETSv6_SRC "))) or " \
         "(outbound and " \
-         "(tcp.DstPort == 80 or tcp.DstPort == 443 or tcp.DstPort == 2096) and tcp.Ack and " \
+         "(tcp.DstPort == 80 or tcp.DstPort == 443) and (tcp.Ack or (!tcp.Ack and tcp.Syn)) and " \
          "(" DIVERT_NO_LOCALNETSv4_DST " or " DIVERT_NO_LOCALNETSv6_DST "))" \
         "))"
-#define FILTER_PASSIVE_BLOCK_QUIC "outbound and !impostor and !loopback and udp " \
-        "and udp.DstPort == 443 and udp.PayloadLength >= 1200 " \
-        "and udp.Payload[0] >= 0xC0 and udp.Payload32[1b] == 0x01"
+        
 #define FILTER_PASSIVE_STRING_TEMPLATE "inbound and ip and tcp and " \
         "!impostor and !loopback and " \
         "(true " IPID_TEMPLATE ") and " \
         "(tcp.SrcPort == 443 or tcp.SrcPort == 80) and tcp.Rst and " \
         DIVERT_NO_LOCALNETSv4_SRC
+#else
+#define FILTER_STRING_TEMPLATE \
+        "(tcp and !impostor " MAXPAYLOADSIZE_TEMPLATE " and " \
+        "((inbound and (" \
+         "(" \
+          "(" \
+           "(ipv6 or (ip.Id >= 0x0 and ip.Id <= 0xF) " IPID_TEMPLATE \
+           ") and " \
+           "tcp.SrcPort == 80 and tcp.Ack" \
+          ") or " \
+          "((tcp.SrcPort == 80 or tcp.SrcPort == 443) and ((tcp.Ack and tcp.Syn) or tcp.Ack))" \
+         ")" \
+         ")) or " \
+        "(outbound and " \
+         "(tcp.DstPort == 80 or tcp.DstPort == 443) and tcp.Ack" \
+         ")" \
+        "))"
+
+#define FILTER_PASSIVE_STRING_TEMPLATE "inbound and ip and tcp and " \
+        "!impostor and !loopback and " \
+        "(true " IPID_TEMPLATE ") and " \
+        "(tcp.SrcPort == 443 or tcp.SrcPort == 80) and tcp.Rst"
+#endif
+#define FILTER_PASSIVE_BLOCK_QUIC "outbound and !impostor and !loopback and udp " \
+        "and udp.DstPort == 443 and udp.PayloadLength >= 1200 " \
+        "and udp.Payload[0] >= 0xC0 and udp.Payload32[1b] == 0x01"
 
 #define SET_HTTP_FRAGMENT_SIZE_OPTION(fragment_size) do { \
     if (!http_fragment_size) { \
@@ -206,9 +235,23 @@ static struct option long_options[] = {
     {"tls-segmentation",required_argument,0,'b'},
     {"ext-frag-size",required_argument,0,  '=' },
     {"vortex-frag", no_argument,       0,  '0' },
+    {"vortex-frag-by-sni",no_argument, 0,  'V' },
     {"tls-segment-size",required_argument,0,'M'},
-    {"fatass",      required_argument, 0,  'X' },
     {"tls-absolute-frag",required_argument,0,'O'},
+    {"tls-rando-frag",no_argument,     0,  'R' },
+    {"vortex-left-bias",required_argument,0,'A'},
+    {"vortex-right-bias",required_argument,0,'D'},
+    {"rplrr",       no_argument,       0,  'P' },
+    {"rplrr-by-sni",no_argument,       0,  'S' },
+    {"mss",         required_argument, 0,  'J' },
+    {"record-frag", no_argument,       0,  'E' },
+    {"allow-sni-overlap",no_argument,  0,  'G' },
+    {"disable-sack",no_argument,       0,  'Z' },
+    {"tls-recseg-size",required_argument,0,'C' },
+    {"cleave-sni",  no_argument,       0,  'N' },
+    {"host-shiftback",required_argument,0, 'K' },
+    {"fragnt",      no_argument,       0,  'I' },
+    {"reverse-fix", no_argument,       0,  'Q' },
     {0,             0,                 0,   0  }
 };
 
@@ -235,25 +278,7 @@ static void add_filter_str(int proto, int port) {
     filter_string = new_filter;
     free(current_filter);
 }
-/*
-static void add_filter_str_portless(int proto) {
-    const char *udp = " or (udp and !loopback and outbound and !impostor and !fragment)";
-    const char *tcp = " or (tcp and and !loopback and !impostor " MAXPAYLOADSIZE_TEMPLATE ")";
 
-    char *current_filter = filter_string;
-    size_t new_filter_size = strlen(current_filter) +
-            (proto == IPPROTO_UDP ? strlen(udp) : strlen(tcp)) + 16;
-    char *new_filter = malloc(new_filter_size);
-
-    strcpy(new_filter, current_filter);
-    if (proto == IPPROTO_UDP)
-        sprintf(new_filter + strlen(new_filter), udp);
-    else
-        sprintf(new_filter + strlen(new_filter), tcp);
-
-    filter_string = new_filter;
-    free(current_filter);
-}*/
 static void add_ip_id_str(int id) {
     char *newstr;
     const char *ipid = " or ip.Id == %d";
@@ -299,9 +324,11 @@ static void finalize_filter_strings() {
     free(filter_passive_string);
     filter_passive_string = newstr;
 }
+
 unsigned short epoch = 0;
-unsigned short shift;
-unsigned short genrand16(unsigned short seed) {
+unsigned short genrand16(unsigned short seed) { //This is possibly the most important function in this code.
+    unsigned short localepoch = epoch;
+    unsigned short shift;
     unsigned short num = seed; 
     for (unsigned int i = 0; i <= epoch; i++) {
         shift = num & 0xFF + (num >> 8 & 0xFF);
@@ -311,6 +338,18 @@ unsigned short genrand16(unsigned short seed) {
         num += (num * num & 0xA + (num >> 6) & 0xB);
     }
     epoch++;
+    return num;
+}
+unsigned short genrand4(unsigned short seed) {
+    return (genrand16(seed) & 0xF ^ ((genrand16(seed) >> 4) & 0xF) ^ ((genrand16(seed) >> 8) & 0xF) ^ ((genrand16(seed) >> 12) & 0xF));
+}
+unsigned short genrand2(unsigned short seed) {
+    unsigned short rand = 0;
+    unsigned char num = 0;
+    while (num == 0) {
+        rand = genrand16(seed);
+        num = (rand & 3 ^ ((rand >> 2 & 3)) ^ ((rand >> 4 & 3)) ^ ((rand >> 6 & 3)) ^ ((rand >> 8 & 3)) ^ ((rand >> 10 & 3)) ^ ((rand >> 12 & 3)) ^ ((rand >> 14 & 3)));
+    }
     return num;
 }
 
@@ -366,33 +405,40 @@ static HANDLE init(char *filter, UINT64 flags) {
                   (LPTSTR)&errormessage, 0, NULL);
     printf("Error opening filter: %d %s\n", errorcode, errormessage);
     LocalFree(errormessage);
-    if (errorcode == 2)
-        printf("The driver files WinDivert32.sys or WinDivert64.sys were not found.\n");
-    else if (errorcode == 654)
-        printf("An incompatible version of the WinDivert driver is currently loaded.\n"
-               "Please unload it with the following commands ran as administrator:\n\n"
-               "sc stop windivert\n"
-               "sc delete windivert\n"
-               "sc stop windivert14"
-               "sc delete windivert14\n");
-    else if (errorcode == 1275)
-        printf("This error occurs for various reasons, including:\n"
-               "the WinDivert driver is blocked by security software; or\n"
-               "you are using a virtualization environment that does not support drivers.\n");
-    else if (errorcode == 1753)
-        printf("This error occurs when the Base Filtering Engine service has been disabled.\n"
-               "Enable Base Filtering Engine service.\n");
-    else if (errorcode == 577)
-        printf("Could not load driver due to invalid digital signature.\n"
-               "Windows Server 2016 systems must have secure boot disabled to be \n"
-               "able to load WinDivert driver.\n"
-               "Windows 7 systems must be up-to-date or at least have KB3033929 installed.\n"
-               "https://www.microsoft.com/en-us/download/details.aspx?id=46078\n\n"
-               "WARNING! If you see this error on Windows 7, it means your system is horribly "
-               "outdated and SHOULD NOT BE USED TO ACCESS THE INTERNET!\n"
-               "Most probably, you don't have security patches installed and anyone in your LAN or "
-               "public Wi-Fi network can get full access to your computer (MS17-010 and others).\n"
-               "You should install updates IMMEDIATELY.\n");
+    switch (errorcode) {
+        case 2:
+            printf("The driver files WinDivert32.sys or WinDivert64.sys were not found.\n");
+            break;
+        case 654:
+            printf("An incompatible version of the WinDivert driver is currently loaded.\n"
+                   "Please unload it with the following commands ran as administrator:\n\n"
+                   "sc stop windivert\n"
+                   "sc delete windivert\n"
+                   "sc stop windivert14"
+                   "sc delete windivert14\n");
+            break;
+        case 1275:
+            printf("This error occurs for various reasons, including:\n"
+                   "the WinDivert driver is blocked by security software; or\n"
+                   "you are using a virtualization environment that does not support drivers.\n");
+            break;
+        case 1753:
+            printf("This error occurs when the Base Filtering Engine service has been disabled.\n"
+                   "Enable Base Filtering Engine service.\n");
+            break;
+        case 577:
+            printf("Could not load driver due to invalid digital signature.\n"
+                   "Windows Server 2016 systems must have secure boot disabled to be \n"
+                   "able to load WinDivert driver.\n"
+                   "Windows 7 systems must be up-to-date or at least have KB3033929 installed.\n"
+                   "https://www.microsoft.com/en-us/download/details.aspx?id=46078\n\n"
+                   "WARNING! If you see this error on Windows 7, it means your system is horribly "
+                   "outdated and SHOULD NOT BE USED TO ACCESS THE INTERNET!\n"
+                   "Most probably, you don't have security patches installed and anyone in your LAN or "
+                   "public Wi-Fi network can get full access to your computer (MS17-010 and others).\n"
+                   "You should install updates IMMEDIATELY.\n");
+            break;
+    }
     return NULL;
 }
 
@@ -410,18 +456,42 @@ void deinit_all() {
         deinit(filters[i]);
     }
 }
-unsigned int activate_thrash = 0;
+unsigned char activate_thrash = 0;
+unsigned char doing_conntrack = 0;
+unsigned char synning = 0;
 HANDLE thrash_filter;
+HANDLE conntrack_filter;
+HANDLE synner_filter;
 static void sigint_handler(int sig __attribute__((unused))) {
+    printf("Attempting shutdown...\n");
     exiting = 1;
     deinit_all();
     if (activate_thrash) {
 	    WinDivertShutdown(thrash_filter, WINDIVERT_SHUTDOWN_BOTH);
 	    WinDivertClose(thrash_filter);
     }
+    if (doing_conntrack) {
+	    WinDivertShutdown(conntrack_filter, WINDIVERT_SHUTDOWN_BOTH);
+	    WinDivertClose(conntrack_filter);
+    }
+    if (synning) {
+	    WinDivertShutdown(synner_filter, WINDIVERT_SHUTDOWN_BOTH);
+	    WinDivertClose(synner_filter);
+    }
     exit(EXIT_SUCCESS);
 }
-
+static void sigsegv_handler(int sig __attribute__((unused))) {
+    exiting = 1;
+    deinit_all();
+    if (activate_thrash) {
+	    WinDivertShutdown(thrash_filter, WINDIVERT_SHUTDOWN_BOTH);
+	    WinDivertClose(thrash_filter);
+    }
+    printf("Segmentation Fault\n");
+    #ifndef DEBUG
+    exit(0xC0000005);
+    #endif
+}
 static void mix_case(char *pktdata, unsigned int pktlen) {
     unsigned int i;
     if (pktlen <= 0) return;
@@ -553,7 +623,10 @@ static PVOID find_http_method_end(const char *pkt, unsigned int http_frag, int *
     }
     return NULL;
 }
-
+unsigned int nothinging = 0;
+void do_nothing() { //Behold, the do-nothinginator!
+    nothinging = 0;
+}
 unsigned char analyze_ver, analyze_hlen, analyze_typeofservice, analyze_ttl, analyze_protocol;
 uint16_t analyze_totallength, analyze_ID, analyze_fragoff, analyze_hdrchksum, analyze_srcport, analyze_dstport, analyze_udplen, analyze_chksum;
 unsigned char analyze_reserved, analyze_dontfragment, analyze_morefragments;
@@ -572,7 +645,7 @@ void xprint(char* pchar, unsigned int size, unsigned int wrap) {
 }
 const char hex[16] = "0123456789ABCDEF";
 char hexholder[3] = "00\0";
-void hexprint(char* pchar, unsigned int size) {
+void hexprint(unsigned char* pchar, unsigned int size) {
     for (int i = 0; i < size; i++) {
         hexholder[0] = hex[pchar[i] / 16];
         hexholder[1] = hex[pchar[i] % 16];
@@ -619,7 +692,8 @@ unsigned int analyze_seq = 0, analyze_ack = 0;
 unsigned char analyze_dataoffset = 0;
 unsigned short analyze_window = 0, analyze_tcpchecksum = 0, analyze_urgentpointer = 0;
 char empty[4] = "...\0";
-void analyze_tcp_header(unsigned char* packet, unsigned char iphdrlen) {
+void analyze_tcp_header(unsigned char* packet) {
+    unsigned char iphdrlen = (packet[0] & 0xF) * 4;
     convert_endian(&analyze_srcport, packet + iphdrlen, 2);
     convert_endian(&analyze_dstport, packet + iphdrlen + 2, 2);
     convert_endian(&analyze_seq, packet + iphdrlen + 4, 4);
@@ -631,19 +705,40 @@ void analyze_tcp_header(unsigned char* packet, unsigned char iphdrlen) {
     printf("Flags: %s.%s.%s.%s.%s.%s.%s.%s\nSource port: %u\nDestination port: %u\nSequence number: %u\nAcknowledgement number: %u\nData offset: %u\nReserved: %u\nWindow: %u\nChecksum: %u\nUrgent pointer: %u\n\n", ((packet + iphdrlen)[13] & 0x80) > 0 ? "CWR" : empty, ((packet + iphdrlen)[13] & 0x40) > 0 ? "ECE" : empty, ((packet + iphdrlen)[13] & 0x20) > 0 ? "URG" : empty, ((packet + iphdrlen)[13] & 0x10) > 0 ? "ACK" : empty, ((packet + iphdrlen)[13] & 0x8) > 0 ? "PSH" : empty, ((packet + iphdrlen)[13] & 0x4) > 0 ? "RST" : empty, ((packet + iphdrlen)[13] & 0x2) > 0 ? "SYN" : empty, ((packet + iphdrlen)[13] & 0x1) > 0 ? "FIN" : empty,
     analyze_srcport, analyze_dstport, analyze_seq, analyze_ack, analyze_dataoffset, analyze_reserved, analyze_window, analyze_tcpchecksum, analyze_urgentpointer);
 }
-unsigned short ciphersuitelen = 0, extlen = 0;
+unsigned short ciphersuitelen = 0, extlen = 0, analyze_progress = 0, analyze_extlen = 0, analyze_exttype = 0, progress = 0;
 unsigned char session_len = 0, compresslen = 0;
 //unsigned char mockPacket[250] = {0x45, 0x0, 0x0, 0xD2, 0x0, 0x0, 0x40, 0x0, 0x80, 0x6, 0x0, 0x0, 0x7F, 0x0, 0x0, 0x1, 0x7F, 0x0, 0x0, 0x1, 0xFF, 0xFF, 0x01, 0xBB, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x50, 0b00010000, 0xFF, 0xFF, 0x0, 0x0, 0x0, 0x0, 0x16, 0x3, 0x1, 0x0, 0xA5, 0x1, 0x0, 0x0, 0xA1, 0x3, 0x3, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x0, 0x0, 0x20, 0xCC, 0xA8, 0xCC, 0xA9, 0xC0, 0x2F, 0xC0, 0x30, 0xC0, 0x2B, 0xC0, 0x2C, 0xC0, 0x13, 0xC0, 0x9, 0xC0, 0x14, 0xC0, 0x0A, 0x0, 0x9C, 0x0, 0x9D, 0x00, 0x2F, 0x0, 0x35, 0xC0, 0x12, 0x0, 0xA, 0x1, 0x0, 0x0, 0x58, 0x0, 0x0, 0x0, 0x18, 0x0, 0x16, 0x0, 0x0, 0x13, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65, 0x2E, 0x75, 0x6C, 0x66, 0x68, 0x65, 0x69, 0x6D, 0x2E, 0x6E, 0x65, 0x74, 0x0, 0x5, 0x0, 0x5, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0xA, 0x0, 0xA, 0x0, 0x8, 0x0, 0x1D, 0x0, 0x17, 0x0, 0x18, 0x0, 0x19, 0x0, 0xB, 0x0, 0x2, 0x1, 0x0, 0x0, 0xD, 0x0, 0x12, 0x0, 0x10, 0x4, 0x1, 0x4, 0x3, 0x5, 0x1, 0x5, 0x3, 0x6, 0x1, 0x6, 0x3, 0x2, 0x1, 0x2, 0x3, 0xFF, 0x1, 0x0, 0x1, 0x0, 0x0, 0x12, 0x0, 0x0};
 void analyze_tls_clienthello(unsigned char* packet) {
     analyze_hlen = (packet[0] & 0b00001111) * 4;
     analyze_dataoffset = ((packet + analyze_hlen)[12] >> 4) * 4;
+    printf("Version: %u.%u\n", packet[analyze_hlen + analyze_dataoffset + 9] - 2, packet[analyze_hlen + analyze_dataoffset + 10] - 1);
     convert_endian(&analyze_totallength, packet + 2, 2);
     session_len = packet[analyze_hlen + analyze_dataoffset + 43];
     convert_endian(&ciphersuitelen, packet + analyze_hlen + analyze_dataoffset + 44 + session_len, 2);
     compresslen = packet[analyze_hlen + analyze_dataoffset + 46 + session_len + ciphersuitelen];
     convert_endian(&extlen, packet + analyze_hlen + analyze_dataoffset + session_len + ciphersuitelen + compresslen + 47, 2);
+    analyze_progress = session_len + ciphersuitelen + compresslen + 49;
     //xprint(packet, analyze_totallength, 40);
     printf("Session Length: %u\nCipher Suite Length: %u\nCompression Method Length: %u\nExtensions Length: %u\n", session_len, ciphersuitelen, compresslen, extlen);
+    printf("Extensions:\n");
+    printf("%u, %u\n", analyze_progress, analyze_totallength - analyze_hlen - analyze_dataoffset);
+    while (analyze_progress < analyze_totallength - analyze_hlen - analyze_dataoffset) {
+        if (analyze_totallength - analyze_dataoffset - analyze_hlen - analyze_progress >= 4) {
+            convert_endian(&analyze_exttype, packet + analyze_dataoffset + analyze_hlen + analyze_progress, 2);
+            convert_endian(&analyze_extlen, packet + analyze_dataoffset + analyze_hlen + analyze_progress + 2, 2);
+            printf("Type: %u, Length: %u%s\n", analyze_exttype, analyze_extlen, analyze_exttype == 65037 ? " [ECH DETECTED]" : (analyze_exttype == 1 ? "[MAX_FRAGMENT_LENGTH SPECIFIED]" : ""));
+            if (analyze_exttype == 64768) {
+                xprint(packet + analyze_dataoffset + analyze_hlen + analyze_progress + 4, analyze_extlen, 0);
+                printf("\n");
+            }
+            if (analyze_exttype == 0) {
+                xprint(packet + analyze_dataoffset + analyze_hlen + analyze_progress + 9, analyze_extlen - 5, 0);
+                printf("\n");
+            }
+            analyze_progress += 4 + analyze_extlen;
+        }
+    }
+    printf("\n");
 }
 unsigned int diffs = 0;
 void differentiate(unsigned char* compared, unsigned int comparedsize, unsigned char* compare, unsigned int comparesize, char showmatching) {
@@ -667,7 +762,7 @@ void differentiate(unsigned char* compared, unsigned int comparedsize, unsigned 
  * the beginning of the packet (step=1) with fragment_size bytes.
  */
 static void send_native_fragment(HANDLE w_filter, WINDIVERT_ADDRESS addr,
-                        char *packet, UINT packetLen, PVOID packet_data,
+                        char *packet, UINT packetLen, unsigned char* packet_data,
                         UINT packet_dataLen, int packet_v4, int packet_v6,
                         PWINDIVERT_IPHDR ppIpHdr, PWINDIVERT_IPV6HDR ppIpV6Hdr,
                         PWINDIVERT_TCPHDR ppTcpHdr,
@@ -893,6 +988,7 @@ void reassemble_segments(unsigned char* packet, unsigned char* reassembleOut, un
 }
 void reassemble_and_compare(unsigned char* packet, unsigned char* reassembleOut, unsigned int baseSeq, unsigned char* knowngood) {
     char corrupted = 0;
+    char overlapping = 0;
     hdrLen = (packet[0] & 0x0F) * 4;
     dataOffset = (packet[hdrLen + 12] >> 4) * 4;
     convert_endian(&tcpSeq, packet + hdrLen + 4, 4);
@@ -904,14 +1000,212 @@ void reassemble_and_compare(unsigned char* packet, unsigned char* reassembleOut,
     for (unsigned int i = 0; i < totalLength - hdrLen - dataOffset; i++) {
         //printf("STEP: %u, %u, %u, %u\n", i, tcpSeq - baseSeq, tcpSeq, baseSeq);
         if (knowngood[i + (tcpSeq - baseSeq)] != packet[hdrLen + dataOffset + i]) corrupted = 1;
+        if (reassembleOut[i + (tcpSeq - baseSeq)] != 255) overlapping = 1; //I'm an idiot.
     }
     if (!corrupted) memcpy(reassembleOut + (tcpSeq - baseSeq), packet + hdrLen + dataOffset, totalLength - hdrLen - dataOffset);
     else printf("This segment is corrupted! Not reinjecting.\n");
+    if (overlapping) printf("Overlap Detected\n");
 }
-unsigned short packetid;
+unsigned short tls_reassembly_progress = 0;
+unsigned short tls_recordLen = 0;
+unsigned char reassembleTls[65536];
+unsigned char istlshandshake(unsigned char* packet_data) {
+    tls_recordLen = ntohs(*((unsigned short*)(packet_data + 3)));
+    if (packet_data[0] == 0x16 && packet_data[1] == 3 && packet_data[2] < 4 && packet_data[2] >= 1 && tls_recordLen <= 16384) return TRUE;
+    else return FALSE;
+}
+void reassemble_tls(unsigned char* packet) {
+    hdrLen = (packet[0] & 0x0F) * 4;
+    dataOffset = (packet[hdrLen + 12] >> 4) * 4;
+    totalLength = ntohs(*((unsigned short*)(packet + 2)));
+    //This must be as strict as the destination.
+    if (packet[hdrLen + dataOffset] != 0x16) {
+        printf("REASSEMBLY ERROR: Not a handshake message. (%u)\n", packet[hdrLen + dataOffset]);
+        return;
+    }
+    if (packet[hdrLen + dataOffset + 1] != 3 || packet[hdrLen + dataOffset + 2] > 4 || packet[hdrLen + dataOffset + 2] < 1) {
+        printf("REASSEMBLY ERROR: Not a TLS 1.0 - 1.3 record. (%u)\n", packet[hdrLen + dataOffset]);
+        return;
+    }
+    tls_recordLen = ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + 3)));
+    if (tls_recordLen != totalLength - hdrLen - dataOffset - 5) {
+        printf("REASSEMBLY ERROR: Record is smaller or larger than this packet can contain.\n");
+        return;
+    }
+    memcpy(reassembleTls + tls_reassembly_progress, packet + hdrLen + dataOffset + 5, tls_recordLen);
+    tls_reassembly_progress += tls_recordLen;
+}
+void reassemble_tls_bald(unsigned char* record) { //Headerless. Amazing.
+    //This must be as strict as the destination.
+    if (record[0] != 0x16) {
+        printf("REASSEMBLY ERROR: Not a handshake message. (%u)\n", record[0]);
+        return;
+    }
+    if (record[1] != 3 || record[2] > 4 || record[2] < 1) {
+        printf("REASSEMBLY ERROR: Not a TLS 1.0 - 1.3 record. (%u.%u)\n", record[1], record[2]);
+        return;
+    }
+    tls_recordLen = ntohs(*((unsigned short*)(record + 3)));
+    if (tls_recordLen > 16384) {
+        printf("REASSEMBLY ERROR: Record is larger than 2^14 (16384) bytes.\n");
+        return;
+    }
+    memcpy(reassembleTls + tls_reassembly_progress, record + 5, tls_recordLen);
+    tls_reassembly_progress += tls_recordLen;
+}
+struct extension {
+    unsigned short type;
+    unsigned short length;
+    unsigned char* data;
+};
+struct clienthello {
+    unsigned int length;
+    unsigned short version;
+    unsigned char random[32];
+    unsigned char sessionidlen;
+    unsigned char* sessionid;
+    unsigned short ciphersuiteslen;
+    unsigned short* ciphersuites;
+    unsigned char compressionmethodslen;
+    unsigned char* compressionmethods;
+    unsigned short extensionCount;
+    struct extension* extensions;
+};
+struct connection {
+    unsigned int ip;
+    unsigned int seq;
+    unsigned short mss;
+    unsigned char taken;
+};
+int parse_clienthello(unsigned char* packet, struct clienthello* clienthello) {
+    unsigned short progress = 5; //Things get messy if this isnt here.
+    unsigned char hdrLen = (packet[0] & 0x0F) * 4;
+    unsigned char dataOffset = (packet[hdrLen + 12] >> 4) * 4;
+    unsigned short totalLength = ntohs(*((unsigned short*)(packet + 2)));
+    if (ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + 3))) + 5 > totalLength - hdrLen - dataOffset) {
+        printf("ERROR: Incomplete packet.\n");
+        return 0;
+    }
+    clienthello->length = ntohl(*((unsigned int*)(packet + hdrLen + dataOffset + progress)) & 0xFFFFFF00);
+    progress += 4;
+    clienthello->version = ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + progress)));
+    printf("PREVER: %u\n", ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + progress))));
+    progress += 2;
+    memcpy(clienthello->random, packet + hdrLen + dataOffset + progress, 32);
+    progress += 32;
+    clienthello->sessionidlen = packet[hdrLen + dataOffset + progress];
+    progress++;
+    if (clienthello->sessionidlen > 0) {
+        clienthello->sessionid = malloc(clienthello->sessionidlen);
+        memcpy(clienthello->sessionid, packet + hdrLen + dataOffset + progress, clienthello->sessionidlen);
+        progress += clienthello->sessionidlen;
+    }
+    clienthello->ciphersuiteslen = ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + progress)));
+    progress += 2;
+    if (clienthello->ciphersuiteslen > 0) { //There's no way this condition isn't true, but nobody knows.
+        clienthello->ciphersuites = malloc(clienthello->ciphersuiteslen);
+        memcpy(clienthello->ciphersuites, packet + hdrLen + dataOffset + progress, clienthello->ciphersuiteslen);
+        progress += clienthello->ciphersuiteslen;
+    }
+    clienthello->compressionmethodslen = packet[hdrLen + dataOffset + progress];
+    progress++;
+    if (clienthello->compressionmethodslen > 0) { //Why must I have to add robustness to shit that never needed it...
+        clienthello->compressionmethods = malloc(clienthello->compressionmethodslen);
+        memcpy(clienthello->compressionmethods, packet + hdrLen + dataOffset + progress, clienthello->compressionmethodslen);
+        progress += clienthello->compressionmethodslen;
+    }
+    progress += 2; //The extensions length is irrelevant due to the nature of the clienthello struct.
+    unsigned short progressbackup = progress;
+    clienthello->extensionCount = 0;
+    while (progress < totalLength - hdrLen - dataOffset) { //Count the extensions.
+        progress += 2; //Ignore the extension type for this moment as it is irrelevant.
+        progress += ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + progress))) + 2;
+        clienthello->extensionCount++;
+    }
+    clienthello->extensions = calloc(clienthello->extensionCount, sizeof(struct extension));
+    unsigned short step = 0;
+    progress = progressbackup;
+    while (progress < totalLength - hdrLen - dataOffset) { //NOW we can get to work.
+        clienthello->extensions[step].type = ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + progress)));
+        progress += 2;
+        clienthello->extensions[step].length = ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + progress))); 
+        progress += 2;
+        clienthello->extensions[step].data = malloc(clienthello->extensions[step].length);
+        memcpy(clienthello->extensions[step].data, packet + hdrLen + dataOffset + progress, clienthello->extensions[step].length);
+        progress += clienthello->extensions[step++].length;
+    }
+    return 1;
+}
+unsigned short rebuild_clienthello(struct clienthello* clienthello, unsigned char* destPacketPayload) { //Builds a handshake record that contains a ClientHello out of that struct.
+    *((unsigned int*)(destPacketPayload)) = 0x00010316;
+    unsigned short progress = 9;
+    *((unsigned short*)(destPacketPayload + progress)) = htons(clienthello->version);
+    printf("VER: %u\n", clienthello->version);
+    progress += 2;
+    memcpy(destPacketPayload + progress, clienthello->random, 32);
+    progress += 32;
+    destPacketPayload[progress] = clienthello->sessionidlen;
+    progress++;
+    if (clienthello->sessionidlen > 0) {
+        memcpy(destPacketPayload + progress, clienthello->sessionid, clienthello->sessionidlen);
+        progress += clienthello->sessionidlen;
+    }
+    *((unsigned short*)(destPacketPayload + progress)) = htons(clienthello->ciphersuiteslen);
+    progress += 2;
+    if (clienthello->ciphersuiteslen > 0) { //There's no way this condition isn't true, but nobody knows.
+        memcpy(destPacketPayload + progress, clienthello->ciphersuites, clienthello->ciphersuiteslen);
+        progress += clienthello->ciphersuiteslen;
+    }
+    destPacketPayload[progress] = clienthello->compressionmethodslen;
+    progress++;
+    if (clienthello->compressionmethodslen > 0) { //Why must I have to add robustness to shit that never needed it...
+        memcpy(destPacketPayload + progress, clienthello->compressionmethods, clienthello->compressionmethodslen);
+        progress += clienthello->compressionmethodslen;
+    }
+    unsigned short extensionsLen = 0; //Gotta discover the extensions length based on the struct.
+    unsigned short progressbackup = progress;
+    progress += 2;
+    for (unsigned short i = 0; i < clienthello->extensionCount; i++) {
+        printf("Constructing extension %u with length %u\n", clienthello->extensions[i].type, clienthello->extensions[i].length);
+        *((unsigned short*)(destPacketPayload + progress)) = htons(clienthello->extensions[i].type);
+        progress += 2;
+        *((unsigned short*)(destPacketPayload + progress)) = htons(clienthello->extensions[i].length);
+        progress += 2;
+        memcpy(destPacketPayload + progress, clienthello->extensions[i].data, clienthello->extensions[i].length);
+        progress += clienthello->extensions[i].length;
+        extensionsLen += 4 + clienthello->extensions[i].length;
+    }
+    unsigned short length = progress - 5;
+    *((unsigned short*)(destPacketPayload + 3)) = htons(length);
+    *((unsigned int*)(destPacketPayload + 5)) = htonl(length - 4) | 0x00000001;
+    progress = progressbackup;
+    *((unsigned short*)(destPacketPayload + progress)) = htons(extensionsLen);
+    printf("Record length: %u\n", length);
+    return length + 5;
+}
+void delete_clienthello(struct clienthello* clienthello) { //Memory management!!!!!
+    printf("Freeing sessionid (if there is one)\n");
+    if (clienthello->sessionidlen > 0) free(clienthello->sessionid);
+    printf("Freeing cipher suites\n");
+    if (clienthello->ciphersuiteslen > 0) free(clienthello->ciphersuites);
+    printf("Freeing compression methods\n");
+    if (clienthello->compressionmethodslen > 0) free(clienthello->compressionmethods);
+    printf("Freeing extensions\n");
+    for (unsigned short i = 0; i < clienthello->extensionCount; i++) 
+    if (clienthello->extensions[i].length > 0) free(clienthello->extensions[i].data);
+    printf("Freeing structs\n");
+    free(clienthello->extensions);
+    printf("Finish\n");
+}
 void newpacketid(unsigned char* packet) {
+    unsigned short packetid;
+    #ifndef SIGNATURE
     packetid = genrand16(ntohs(*((unsigned short*)(packet + 4))));
     convert_endian(packet + 4, &packetid, 2);
+    #else
+    packetid = 12345;
+    convert_endian(packet + 4, &packetid, 2);
+    #endif
 }
 //bigass pile of useless shit
 /*
@@ -1095,37 +1389,85 @@ bool domainScan(char* packet_data, UINT packet_dataLen, unsigned char** domainOu
     return false;
 }
 */
-unsigned int fragmentInfoLen = 0;
+unsigned short beginSni = 0;
+unsigned short endSni = 0;
+unsigned short fragmentInfoLen = 0;
 struct fragmentInfoChunk {
     unsigned int seq;
     uint16_t payloadLen;
+};
+struct fragmentInfo {
+    unsigned short length;
+    struct fragmentInfoChunk fragments[MAX_PACKET_SIZE - 40];
 };
 struct clientHelloSearchChunk {
     unsigned int seq;
     unsigned int ip;
     unsigned char life;
+    unsigned short exttype;
+    unsigned short extlen;
+    unsigned short stage; //stage 0: sent first byte of ext type, stage 1: interrupted by incomplete payload, sent second byte of ext type, stage 2: sent second byte of ext type and first byte of ext len, stage 3: sent second byte of ext len, proceed with fragmenting along ext len, stage 4: perfectly fragmented, initiate as usual
 };
+struct conntracksig { //Rudimentary conntrack. This also means that if you shut down goodbyeDPI, all goes to shit and everything needs to reconnect.
+    unsigned char busy;
+    unsigned int ip;
+    int offset;
+    unsigned int upperseq; //SEQ upper bound
+    unsigned int lowerseq; //SEQ lower bound
+    unsigned int originseq;
+    unsigned char overload[5]; //Storage for reassembling overloaded TLS record headers.
+    unsigned short tlsver; //TLS Version. Pulled from application data packets. [Very useless.]
+    unsigned char overloadlen;
+    unsigned int nextrecord;
+    unsigned short nextpacketid;
+    unsigned char ccssent;
+    unsigned char retransmits;
+    unsigned char outfin; //MAYBE killing the connection as soon as ONE FIN leaves from OUR COMPUTER isn't a great idea.
+    unsigned char infin;
+    unsigned char lastack;
+    char associatedsni[256];
+    WINDIVERT_ADDRESS addr;
+};
+struct fatasssig {
+    unsigned short life;
+    unsigned int ip;
+    unsigned int seq;
+    unsigned int originseq;
+    unsigned short recordlength;
+    unsigned short expectedlength;
+    unsigned char iphdrlen;
+    unsigned char dOffset;
+    unsigned char packet[4216];
+};
+struct fatasssig* fatass = NULL;
+unsigned short fatasslen = 0;
+struct conntracksig* conntrack;
+unsigned int conntrack_ip;
+unsigned int conntrack_seq;
 struct fragmentInfoChunk* fragmentInfo;
 struct clientHelloSearchChunk* clientHelloSearch;
-void add_fragment(unsigned char* packet) {
+void add_fragment(unsigned char* packet, struct fragmentInfoChunk* fragmentInfo, unsigned short* pfragmentInfoLen) {
     //Skip over to the whole- yeah, this is just copied code from reassemble_segments
     hdrLen = (packet[0] & 0x0F) * 4;
     dataOffset = (packet[hdrLen + 12] >> 4) * 4;
     convert_endian(&tcpSeq, packet + hdrLen + 4, 4);
     convert_endian(&totalLength, packet + 2, 2);
-    fragmentInfo[fragmentInfoLen].seq = tcpSeq;
-    fragmentInfo[fragmentInfoLen].payloadLen = totalLength - hdrLen - dataOffset;
-    //printf("DEBUGGUS: %u, %u; %u, %u\n", fragmentInfo[fragmentInfoLen].seq, fragmentInfo[fragmentInfoLen].payloadLen, tcpSeq, totalLength - hdrLen - dataOffset);
+    fragmentInfo[*pfragmentInfoLen].seq = tcpSeq;
+    fragmentInfo[*pfragmentInfoLen].payloadLen = totalLength - hdrLen - dataOffset;
+    //printf("DEBUGGUS: %u, %u; %u, %u\n", fragmentInfo[*pfragmentInfoLen].seq, fragmentInfo[*pfragmentInfoLen].payloadLen, tcpSeq, totalLength - hdrLen - dataOffset);
     fragmentInfoLen++;
 }
 int main(int argc, char *argv[]) {
     //hexbuff[2] = (char)0;
     fragmentHolder = calloc(MAX_PACKET_SIZE, sizeof(char));
     reassemblePacket = calloc(MAX_PACKET_SIZE, sizeof(char));
-    unsigned char* reassembleSegments = calloc(MAX_PACKET_SIZE, sizeof(unsigned char));
-    unsigned char* packetBACK = calloc(MAX_PACKET_SIZE, sizeof(unsigned char));
+    fatass = calloc(512, sizeof(struct fatasssig));
+    unsigned char* reassembleSegments = calloc(4216, sizeof(unsigned char));
+    unsigned char* packetBACK = calloc(MAX_PACKET_SIZE * 8, sizeof(unsigned char));
     fragmentInfo = calloc(MAX_PACKET_SIZE - 40, sizeof(struct fragmentInfoChunk));
     clientHelloSearch = calloc(25, sizeof(struct clientHelloSearchChunk));
+    struct connection* connections = calloc(512, sizeof(struct connection));
+    unsigned short connectionslen = 0;
     static enum packet_type_e {
         unknown,
         ipv4_tcp, ipv4_tcp_data, ipv4_udp_data,
@@ -1138,9 +1480,13 @@ int main(int argc, char *argv[]) {
     packet_v4, packet_v6;
     HANDLE w_filter = NULL;
     WINDIVERT_ADDRESS addr;
-    unsigned char packet[MAX_PACKET_SIZE];
-    PVOID packet_data;
-    UINT packetLen;
+    unsigned char realpacket[MAX_PACKET_SIZE];
+    unsigned char extendedpacket[MAX_PACKET_SIZE * 8];
+    unsigned char* packet = NULL;
+    unsigned char ctrack_fragmentHolder[MAX_PACKET_SIZE];
+    unsigned char recordbuffer[65535]; //The giant enemy record.
+    unsigned char* packet_data;
+    UINT packetLen, packetBACKLen;
     UINT packet_dataLen;
     PWINDIVERT_IPHDR ppIpHdr;
     PWINDIVERT_IPV6HDR ppIpV6Hdr;
@@ -1148,6 +1494,7 @@ int main(int argc, char *argv[]) {
     PWINDIVERT_UDPHDR ppUdpHdr;
     conntrack_info_t dns_conn_info;
     tcp_conntrack_info_t tcp_conn_info;
+    unsigned int conntrack_maxlen = 0, disable_sack = 0, conntrack_curlen = 0, findmss = 0;
     int do_passivedpi = 0, do_block_quic = 0,
         do_fragment_http = 0,
         do_fragment_http_persistent = 0,
@@ -1157,18 +1504,24 @@ int main(int argc, char *argv[]) {
         do_http_allports = 0,
         do_host_mixedcase = 0,
         do_dnsv4_redirect = 0, do_dnsv6_redirect = 0,
-        do_dns_verb = 0, drop_unsecure_dns = 0, do_tcp_verb = 0, do_blacklist = 0, do_whitelist = 0, 
+        do_dns_verb = 0, drop_unsecure_dns = 0, do_tcp_verb = 0, do_blacklist = 0, do_whitelist = 0,
         do_allow_no_sni = 0,
         do_fragment_by_sni = 0,
         do_fake_packet = 0,
         do_auto_ttl = 0,
         do_wrong_chksum = 0,
         do_wrong_seq = 0,
+        allow_sni_overlap = 0,
         tls_segmentation = 0,
-        do_native_frag = 0, do_reverse_frag = 0, super_reverse = 0, smart_frag = 0, compound_frag = 0, tls_force_native = 0, /*udp_fragments = 0, */proceed = 0, totalHdrLength = 0, acted = 0,
-        vortex_frag = 0, vortex_step = 0, vortex_left = 0, vortex_right = 0, vortex_relevant = 0, freeWaiting = 0, fatass = 0; //"Big boy words" my ass, it's literally vortex shaped.
-    unsigned int http_fragment_size = 0, https_fragment_size = 0, tls_segment_size = 0, sni_fragment_size = 0, ext_frag_size = 0, tls_absolute_frag = 0, current_fragment_size = 0, udp_fakes = 0, progress = 0;
-    unsigned short max_payload_size = 0, extensionLen = 0, extensionType = 0, MTU = 0;
+        tls_rando_frag = 0,
+        fragging_sni = 0,
+        tls_len = 0,
+        no_ccs = 0,
+        wacky_frag = 0, do_native_frag = 0, do_reverse_frag = 0, record_frag = 0, super_reverse = 0, rplrr = 0, rplrr_by_sni, reusable = 0, mss = 0, smart_frag = 0, compound_frag = 0, tls_force_native = 0, /*udp_fragments = 0, */proceed = 0, totalHdrLength = 0, acted = 0,
+        vortex_frag = 0, vortex_frag_by_sni = 0, vortex_step = 0, vortex_left = 0, vortex_direction = 0, vortex_right = 0, vortex_step_left = 1, vortex_step_right = 1, vortex_relevant = 0, freeWaiting = 0; //"Big boy words" my ass, it's literally vortex shaped.
+    unsigned int http_fragment_size = 0, https_fragment_size = 0, tls_segment_size = 0, sni_fragment_size = 0, ext_frag_size = 0, tls_absolute_frag = 0, tls_recseg_size = 0, current_fragment_size = 0, udp_fakes = 0, progress = 0, addoffset = 0, alter_max_record_len = 0;
+    unsigned short max_payload_size = 0, extensionLen = 0, extensionType = 0, sni_padding = 0, cleave_sni = 0;
+    short host_shiftback = 0;
     BYTE should_send_fake = 0;
     BYTE ttl_of_fake_packet = 0;
     BYTE ttl_min_nhops = 0;
@@ -1180,13 +1533,12 @@ int main(int argc, char *argv[]) {
     struct in6_addr dns_temp_addr = {0};
     uint16_t dnsv4_port = htons(53);
     uint16_t dnsv6_port = htons(53);
-    unsigned char *host_addr, *useragent_addr, *method_addr;
+    unsigned char *host_addr, *useragent_addr, *method_addr, fragnt = 0, reverse_fix = 0;
     unsigned int host_len, useragent_len, faketotallength = 0, tcpBaseSeq = 0, tcpBaseSeqTrue = 0;
     int http_req_fragmented;
     uint16_t fragmentLength = 0;
     char *hdr_name_addr = NULL, *hdr_value_addr = NULL, iphdrlen;
     unsigned int hdr_value_len;
-
     //Meet the thrash machine!
     unsigned char thrash_packet[65536];
     unsigned char thrash_fake[65536];
@@ -1197,9 +1549,367 @@ int main(int argc, char *argv[]) {
             victim[vicPtr] = victim[vicPtr] ^ key[vicPtr % keyLen];
         }
     }
+    unsigned int checked[2048], checkedLen = 0;
+    unsigned char mode = 0;
+    char overlapping = 0;
+    void do_fragmentation(unsigned char* packet) { //By moving fragmentation into this function, I can put it in many other things.
 
+    }
+    void do_super_reverse_frag(unsigned char mode, struct fragmentInfoChunk* fragmentInfo, unsigned short fragmentInfoLen, unsigned char* srcPacket, unsigned int tcpBaseSeq) {
+        unsigned char hdrLen = (srcPacket[0] & 0b00001111) * 4;
+        unsigned char dataOffset = (srcPacket[hdrLen + 12] >> 4) * 4;
+        unsigned short totalLength;
+        unsigned short vortex_left = 0;
+        unsigned short vortex_right = 0;
+        unsigned short vortex_step = 0;
+        unsigned short vortex_direction = 0;
+        unsigned short vortex_relevant = 0;
+        //printf("Begin Super Reverse\n");
+        for (int i = 0; i < 2048; i++) {
+            reassembleSegments[i] = 255;
+            checked[i] = 0;
+        }
+        switch (mode) {
+            case 1:
+                vortex_left = vortex_frag_by_sni ? beginSni : 0;
+                vortex_right = fragmentInfoLen - 1;
+                vortex_step = 0;
+                vortex_direction = 0;
+                while (vortex_left != vortex_right) {
+                    if (vortex_direction == 0 && vortex_step == vortex_step_left) {
+                        vortex_relevant = vortex_right;
+                        //printf("Alternating to RIGHT\n");
+                        vortex_step = 0;
+                        vortex_direction = 1;
+                    }
+                    else if (vortex_direction == 1 && vortex_step == vortex_step_right) {
+                        vortex_relevant = vortex_left;
+                        //printf("Alternating to LEFT\n");
+                        vortex_step = 0;
+                        vortex_direction = 0;
+                    }
+                    else {
+                        //printf("Not alternating.\n");
+                        if (vortex_direction == 1) vortex_relevant = vortex_right;
+                        if (vortex_direction == 0) vortex_relevant = vortex_left;
+                    }
+                    //begin frag
+                    tcpSeq = fragmentInfo[vortex_relevant].seq;
+                    totalLength = hdrLen + dataOffset + fragmentInfo[vortex_relevant].payloadLen;
+                    convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
+                    convert_endian(fragmentHolder + 2, &totalLength, 2);
+                    memcpy(fragmentHolder + hdrLen + dataOffset, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset);
+                    newpacketid(fragmentHolder);
+                    WinDivertHelperCalcChecksums(
+                        fragmentHolder, totalLength, &addr, 0
+                    );
+                    reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, srcPacket + hdrLen + dataOffset);
+                    WinDivertSend(
+                        w_filter, fragmentHolder,
+                        totalLength,
+                        NULL, &addr
+                    );
+                    //ending sequence
+                    if (vortex_direction == 0) vortex_left++;
+                    else vortex_right--;
+                    vortex_step++;
+                }
+                if (vortex_frag_by_sni) {
+                    for (int i = beginSni - 1; i >= 0; i--) {
+                        tcpSeq = fragmentInfo[i].seq;
+                        totalLength = hdrLen + dataOffset + fragmentInfo[i].payloadLen;
+                        convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
+                        convert_endian(fragmentHolder + 2, &totalLength, 2);
+                        memcpy(fragmentHolder + hdrLen + dataOffset, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset);
+                        newpacketid(fragmentHolder);
+                        WinDivertHelperCalcChecksums(
+                            fragmentHolder, totalLength, &addr, 0
+                        );
+                        reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, srcPacket + hdrLen + dataOffset);
+                        //differentiate(fragmentHolder + hdrLen + dataOffset, totalLength - dataOffset - hdrLen, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset, 1);
+                        WinDivertSend(
+                            w_filter, fragmentHolder,
+                            totalLength,
+                            NULL, &addr
+                        );
+                    }
+                }
+                break;
+            case 2:
+                //printf("Begin RPLRR\n");
+                for (int i = 0; i < 2048; i++) {
+                    reassembleSegments[i] = 255;
+                    checked[i] = 0;
+                }
+                vortex_left = rplrr_by_sni ? beginSni : 0;
+                vortex_step = 0;
+                unsigned int backupInfoLen = fragmentInfoLen;
+                if (rplrr_by_sni) fragmentInfoLen -= beginSni;
+                while (fragmentInfoLen > 0) {
+                    i = genrand16(ntohs(*((unsigned short*)(packet + 4)))) % fragmentInfoLen;
+                    tcpSeq = fragmentInfo[i + vortex_left].seq;
+                    totalLength = hdrLen + dataOffset + fragmentInfo[i + vortex_left].payloadLen;
+                    convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
+                    convert_endian(fragmentHolder + 2, &totalLength, 2);
+                    memcpy(fragmentHolder + hdrLen + dataOffset, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset);
+                    newpacketid(fragmentHolder);
+                    WinDivertHelperCalcChecksums(
+                        fragmentHolder, totalLength, &addr, 0
+                    );
+                    reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, srcPacket + hdrLen + dataOffset);
+                    //differentiate(fragmentHolder + hdrLen + dataOffset, totalLength - dataOffset - hdrLen, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset, 1);
+                    WinDivertSend(
+                        w_filter, fragmentHolder,
+                        totalLength,
+                        NULL, &addr
+                    );
+                    if (i == 0) {
+                        vortex_left++;
+                        goto skipCondLeft;
+                    }
+                    else if (i == fragmentInfoLen - 1) {
+                        fragmentInfoLen--;
+                        goto skipAll;
+                    }
+                    else {
+                        //printf("REPLACING\n");
+                        //printf("PRE:  %u, %u\n", fragmentInfo[i + vortex_left].seq, fragmentInfo[i + vortex_left].payloadLen);
+                        reusable = vortex_step % 2 == 0 ? vortex_left : fragmentInfoLen - 1 + vortex_left;
+                        fragmentInfo[i + vortex_left].seq = fragmentInfo[reusable].seq;
+                        fragmentInfo[i + vortex_left].payloadLen = fragmentInfo[reusable].payloadLen;
+                        //printf("POST: %u, %u\n", fragmentInfo[i + vortex_left].seq, fragmentInfo[i + vortex_left].payloadLen);
+                    }
+                    if (vortex_step % 2 == 0) vortex_left++;
+                    skipCondLeft:
+                    fragmentInfoLen--;
+                    skipAll:
+                    vortex_step++;
+                    //printf("Popped %u, Offset: %u\n", i + vortex_left, vortex_left);
+                }
+                if (rplrr_by_sni) {
+                    for (int i = beginSni - 1; i >= 0; i--) {
+                        tcpSeq = fragmentInfo[i].seq;
+                        totalLength = hdrLen + dataOffset + fragmentInfo[i].payloadLen;
+                        convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
+                        convert_endian(fragmentHolder + 2, &totalLength, 2);
+                        memcpy(fragmentHolder + hdrLen + dataOffset, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset);
+                        newpacketid(fragmentHolder);
+                        WinDivertHelperCalcChecksums(
+                            fragmentHolder, totalLength, &addr, 0
+                        );
+                        reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, srcPacket + hdrLen + dataOffset);
+                        //differentiate(fragmentHolder + hdrLen + dataOffset, totalLength - dataOffset - hdrLen, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset, 1);
+                        WinDivertSend(
+                            w_filter, fragmentHolder,
+                            totalLength,
+                            NULL, &addr
+                        );
+                    }
+                }
+                break;
+            case 3: //It's a shitty shittus. [It works, don't check this.]
+                //Before this thing causes everything to go to shit, check if theres already a conntrack entry for this connection.
+                for (int i = 0; i < conntrack_curlen; i++) {
+                    if (conntrack[i].originseq == tcpBaseSeq) {
+                        #ifdef TLSDEBUG
+                        printf("DUPLICATE\n");
+                        #endif
+                        return;
+                    }
+                }
+                //Find a free conntrack space. (REUSING VARIABLES!!!)
+                freeWaiting = -1;
+                for (int i = 0; i < conntrack_curlen; i++) {
+                    if (conntrack[i].lowerseq == 0 && conntrack[i].ip == 0) {
+                        freeWaiting = i;
+                        break;
+                    }
+                }
+                if (conntrack_curlen == conntrack_maxlen) {
+                    printf("SHIT SHIT SHIT SHIT SHIT SHIT\n");
+                    return;
+                }
+                if (freeWaiting == -1) {
+                    freeWaiting = conntrack_curlen++;
+                }
+                //printf("Expecting SEQ %u\n", tcpBaseSeq + (packetLen + 5 - hdrLen - dataOffset) + (fragmentInfoLen - 1) * 5);
+                if (!fragnt) {
+                    conntrack[freeWaiting].busy = 1;
+                    conntrack[freeWaiting].ip = *((unsigned int*)(packet + 16));
+                    conntrack[freeWaiting].lowerseq = tcpBaseSeq + (packetLen + 5 - hdrLen - dataOffset) - (alter_max_record_len > 0 ? 6 : 0);
+                    conntrack[freeWaiting].upperseq = tcpBaseSeq + (packetLen + 5 - hdrLen - dataOffset) - (alter_max_record_len > 0 ? 6 : 0);
+                    conntrack[freeWaiting].offset = (fragmentInfoLen - 1) * 5 + addoffset;
+                    conntrack[freeWaiting].originseq = tcpBaseSeq;
+                    for (int i = 0; i < host_len; i++) {
+                        conntrack[freeWaiting].associatedsni[i] = host_addr[i];
+                    }
+                    conntrack[freeWaiting].associatedsni[host_len] = 0;
+                    conntrack[freeWaiting].nextrecord = 0;
+                    conntrack[freeWaiting].nextpacketid = ntohs(*((unsigned short*)(srcPacket + 4)));
+                    conntrack[freeWaiting].outfin = 0; 
+                    conntrack[freeWaiting].infin = 0;
+                    conntrack[freeWaiting].ccssent = 0;
+                    conntrack[freeWaiting].busy = 0;
+                    //printf("Packets beginning from SEQ %u will now have their SEQ shifted by %u bytes.\n", conntrack[freeWaiting].lowerseq, conntrack[freeWaiting].offset);
+                    #ifdef TLSDEBUG
+                    printf("Expecting an inbound ACK of %u, Relative ACK: %u\n", conntrack[freeWaiting].upperseq + conntrack[freeWaiting].offset, conntrack[freeWaiting].upperseq + conntrack[freeWaiting].offset - conntrack[freeWaiting].originseq);
+                    #endif
+                }
+                tls_reassembly_progress = 0;
+                progress = 0;
+                unsigned short begin_sni;
+                unsigned short end_sni;
+                for (int i = 0; i < fragmentInfoLen; i++) {
+                    memcpy(recordbuffer + progress + 5, srcPacket + hdrLen + dataOffset + (fragmentInfo[i].seq - tcpBaseSeq), fragmentInfo[i].payloadLen);
+                    *((unsigned int*)(recordbuffer + progress)) = 0x00010316; //Clever, not clever.
+                    *((unsigned short*)(recordbuffer + progress + 3)) = htons(fragmentInfo[i].payloadLen + (i == fragmentInfoLen - 1 ? overload : 0));
+                    reassemble_tls_bald(recordbuffer + progress);
+                    if (i == beginSni) begin_sni = progress;
+                    if (i == endSni) end_sni = progress + 5 + fragmentInfo[i].payloadLen;
+                    progress += 5 + fragmentInfo[i].payloadLen;
+                }
+                unsigned short midpoint = begin_sni + ((end_sni - begin_sni) / 2);
+                tls_len = progress;
+                progress = 0;
+                //for (int i = 0; i < fragmentInfoLen; i++) {
+                //    reassemble_tls_bald(recordbuffer + progress); //BALD! BALD! MY EYEEEEEEEEEES!!!!!
+                //    progress += fragmentInfo[i].payloadLen + 5;
+                //}
+                unsigned int headercatch = 0;
+                memcpy(fragmentHolder, packet, hdrLen + dataOffset);
+                fragmentInfoLen = 0;
+                while (progress != tls_len) {
+                    if (fragmentInfoLen == 1) {
+                        beginSni = fragmentInfoLen;
+                    }
+                    current_fragment_size = (!reverse_fix || progress != 0) ? tls_recseg_size : tls_len % tls_recseg_size;
+                    if (begin_sni > progress && ((begin_sni - (progress + tls_recseg_size) < tls_recseg_size) || (begin_sni < (progress - tls_recseg_size)))) {
+                        current_fragment_size = midpoint - progress;
+                    }
+                    if (progress + current_fragment_size >= tls_len) { //Uh oh.
+                        current_fragment_size = (unsigned int) (tls_len - progress);
+                        if (current_fragment_size == 0) break;
+                    }
+                    if (fragnt && progress + current_fragment_size >= packetBACKLen - hdrLen - dataOffset) { //SIKE!
+                        printf("fragnt\n");
+                        break;
+                    }
+                    else if (fragnt) printf("frag\n");
+                    memcpy(fragmentHolder + hdrLen + dataOffset, recordbuffer + progress, current_fragment_size);
+                    totalLength = hdrLen + dataOffset + current_fragment_size;
+                    convert_endian(fragmentHolder + 2, &totalLength, 2);
+                    tcpSeq = tcpBaseSeq + progress;
+                    convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
+                    newpacketid(fragmentHolder);
+                    WinDivertHelperCalcChecksums(
+                        fragmentHolder, totalLength, &addr, 0
+                    );
+                    if (!tls_force_native) {
+                        add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
+                        fragmentInfoLen++;
+                    }
+                    else 
+                    WinDivertSend(
+                        w_filter, fragmentHolder,
+                        totalLength,
+                        NULL, &addr
+                    );
+                    progress += current_fragment_size;
+                }
+                memmove(recordbuffer + hdrLen + dataOffset, recordbuffer, tls_len);
+                memcpy(recordbuffer, packetBACK, hdrLen + dataOffset);
+                unsigned char mode = 0;
+                if (vortex_frag) mode = 1;
+                else if (rplrr) mode = 2;
+                printf("Sending %u fragments.\n", fragmentInfoLen);
+                if (!tls_force_native)
+                do_super_reverse_frag(mode, fragmentInfo, fragmentInfoLen, recordbuffer, tcpBaseSeqTrue);
+                if (fragnt) {
+                    short mss = 1200;
+                    for (int i = 0; i < connectionslen; i++) {
+                        if (connections[i].taken && connections[i].ip == *((unsigned int*)(srcPacket + 16)) && connections[i].seq == ntohl(*((unsigned int*)(srcPacket + hdrLen + 4)))) {
+                            mss = connections[i].mss;
+                            connections[i].taken = 0;
+                            break;
+                        }
+                    }
+                    if (mss == 1200) printf("ERROR: CONNECTION TRACKING FAIL\n");
+                    if (packetLen > mss) {
+                        memcpy(fragmentHolder, srcPacket, hdrLen + dataOffset);
+                        progress = 0;
+                        while (progress != packetBACKLen - hdrLen - dataOffset) {
+                            current_fragment_size = mss;
+                            if (hdrLen + dataOffset + progress + current_fragment_size >= packetBACKLen) { //Uh oh.
+                                current_fragment_size = (unsigned int) (packetBACKLen - hdrLen - dataOffset - progress);
+                                if (current_fragment_size == 0) break;
+                            }
+                            memcpy(fragmentHolder + hdrLen + dataOffset, srcPacket + hdrLen + dataOffset + progress, current_fragment_size);
+                            totalLength = hdrLen + dataOffset + current_fragment_size;
+                            convert_endian(fragmentHolder + 2, &totalLength, 2);
+                            tcpSeq = tcpBaseSeq + progress;
+                            convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
+                            newpacketid(fragmentHolder);
+                            WinDivertHelperCalcChecksums(
+                                fragmentHolder, totalLength, &addr, 0
+                            );
+                            #ifdef DEBUG
+                            reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeqTrue, srcPacket + hdrLen + dataOffset);
+                            #endif
+                            WinDivertSend(
+                                w_filter, fragmentHolder,
+                                totalLength,
+                                NULL, &addr
+                            );
+                            progress += current_fragment_size;
+                        }
+                    }
+                    else {
+                        WinDivertHelperCalcChecksums(
+                            srcPacket, packetBACKLen, &addr, 0
+                        );
+                        WinDivertSend(
+                            w_filter, srcPacket,
+                            packetBACKLen,
+                            NULL, &addr
+                        );
+                    }
+                }
+                #ifdef TLSPRINT
+                xprint(srcPacket + hdrLen + dataOffset + 5, packetLen - dataOffset - hdrLen, 40);
+                printf("\n\n");
+                xprint(reassembleTls, packetLen - dataOffset - hdrLen, 40);
+                printf("\n");
+                differentiate(srcPacket + hdrLen + dataOffset + 5, packetLen - dataOffset - hdrLen, reassembleTls, packetLen - dataOffset - hdrLen, 0);
+                if (tls_reassembly_progress != packetLen - dataOffset - hdrLen) printf("ERROR: MESSAGE LENGTH MISMATCH\n");
+                #endif
+                break;
+            case 4: // --first-native
+                
+            default:
+                memcpy(fragmentHolder, srcPacket, hdrLen + dataOffset);
+                for (int i = fragmentInfoLen - 1; i >= 0; i--) {
+                    tcpSeq = fragmentInfo[i].seq;
+                    totalLength = hdrLen + dataOffset + fragmentInfo[i].payloadLen;
+                    convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
+                    convert_endian(fragmentHolder + 2, &totalLength, 2);
+                    memcpy(fragmentHolder + hdrLen + dataOffset, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset);
+                    newpacketid(fragmentHolder);
+                    WinDivertHelperCalcChecksums(
+                        fragmentHolder, totalLength, &addr, 0
+                    );
+                    //differentiate(fragmentHolder + hdrLen + dataOffset, totalLength - dataOffset - hdrLen, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset, 1);
+                    WinDivertSend(
+                        w_filter, fragmentHolder,
+                        totalLength,
+                        NULL, &addr
+                    );
+                }
+                break;
+        }
+    }
     void* thrash() { //Why do I need a void* function instead of a void? Oh well.
         thrash_filter = WinDivertOpen("outbound and udp and !impostor and !loopback and udp.DstPort > 49999 and udp.DstPort < 50100\0", WINDIVERT_LAYER_NETWORK, 1, 0);
+        if (thrash_filter != INVALID_HANDLE_VALUE)
         while (!exiting) {
             if (WinDivertRecv(thrash_filter, thrash_packet, 65536, &thrash_packetLen, &thrash_addr)) {
 			    WinDivertHelperCalcChecksums(thrash_packet, thrash_packetLen, &thrash_addr, 0);
@@ -1222,6 +1932,260 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
+    }
+    unsigned char synner_packet[256]; //SYN packets cannot possibly be any larger than this.
+    UINT synner_packetLen;
+    WINDIVERT_ADDRESS synner_addr;
+    //'tis hardcoded.
+    unsigned char synnerhdrLen = 0, synnerdataOffset = 0;
+    #ifndef DOLOCALNETS
+    char synner_filter_str_default[] = "!impostor && !loopback && tcp.Syn && ((outbound && tcp.DstPort == 443) || (inbound && tcp.Ack && tcp.SrcPort == 443))\0";
+    char synner_filter_str_discord_vc[] = "!impostor && !loopback && tcp.Syn && ((outbound && (tcp.DstPort == 443 || (tcp.DstPort > 1999 && tcp.DstPort < 2100))) || (inbound && tcp.Ack && (tcp.SrcPort == 443 || (tcp.SrcPort > 1999 && tcp.SrcPort < 2100))))\0";
+    #else
+    char synner_filter_str_default[] = "!impostor && outbound && tcp.Syn && tcp.DstPort == 443\0";
+    char synner_filter_str_discord_vc[] = "!impostor && outbound && tcp.Syn && (tcp.DstPort == 443 || (tcp.DstPort > 1999 and tcp.DstPort < 2100))\0";
+    #endif
+    char* synner_filter_str = synner_filter_str_default;
+    short connfreewaiting;
+    void* synner() { //For accessing SYN packets without the clutter of main()
+        synner_filter = WinDivertOpen(synner_filter_str, WINDIVERT_LAYER_NETWORK, 2, 0);
+        if (synner_filter != INVALID_HANDLE_VALUE)
+        while (!exiting) {
+            if (WinDivertRecv(synner_filter, synner_packet, 256, &synner_packetLen, &synner_addr)) {
+                synnerhdrLen = (synner_packet[0] & 0xF) * 4;
+                synnerdataOffset = (synner_packet[synnerhdrLen + 12] >> 4) * 4;
+                connfreewaiting = -1;
+                if (!synner_addr.Outbound) {
+                    for (int i = 0; i < connectionslen; i++) {
+                        if (!connections[i].taken) {
+                            freeWaiting = i;
+                            break;
+                        }
+                    }
+                    if (connfreewaiting == -1 && connectionslen == 512) {
+                        printf("CRAP CRAP CRAP CRAP\n");
+                    }
+                    if (connfreewaiting == -1) {
+                        connfreewaiting = connectionslen++;
+                    }
+                    if (!synner_addr.Outbound) {
+                        connections[connfreewaiting].ip = *((unsigned int*)(synner_packet + 12));
+                        connections[connfreewaiting].seq = ntohl(*((unsigned int*)(synner_packet + synnerhdrLen + 8))) - 1; //Gotta hate the 1 added to the SYN/ACK.
+                    }
+                }
+                if (mss > 0) {
+                    findmss = 0;
+                    //Locate the MSS option.
+                    for (int i = synnerhdrLen; i < synnerdataOffset; i += synner_packet[synnerhdrLen + i] > 1 ? synner_packet[synnerhdrLen + i + 1] : 1) { //Actually cramming logic in there. Amazing.
+                        if (synner_packet[synnerhdrLen + i] == 2) {
+                            findmss = i + 2;
+                            break;
+                        }
+                    }
+                    if (findmss != 0) {
+                        if (ntohs(*((unsigned short*)(synner_packet + synnerhdrLen + findmss))) > mss && synner_addr.Outbound) { //Now not stupid!
+                            *((unsigned short*)(synner_packet + synnerhdrLen + findmss)) = htons(mss);
+                        }
+                        if (!synner_addr.Outbound) connections[connfreewaiting].mss = ntohs(*((unsigned short*)(synner_packet + synnerhdrLen + findmss)));
+                    }
+                }
+                if (disable_sack && synner_addr.Outbound) { //Remove SACK_PERM.
+                    for (int i = synnerhdrLen; i < synnerdataOffset; i += synner_packet[synnerhdrLen + i] > 1 ? synner_packet[synnerhdrLen + i + 1] : 1) { //Actually cramming logic in there. Amazing.
+                        if (synner_packet[synnerhdrLen + i] == 4) {
+                            synner_packet[synnerhdrLen + i] = 1; //Replace Option-Kind with NOP.
+                            synner_packet[synnerhdrLen + i + 1] = 1; //Replace Option-Length with NOP.
+                        }
+                    }
+                }
+                WinDivertHelperCalcChecksums(synner_packet, synner_packetLen, &synner_addr, 0);
+                WinDivertSend(synner_filter, synner_packet, synner_packetLen, NULL, &synner_addr);
+                if (!synner_addr.Outbound) connections[connfreewaiting].taken = 1;
+            }
+            else {
+                printf("synning error: %u\n", GetLastError());
+                break;
+            }
+        }
+    }
+    unsigned char conntrack_packet[65536];
+    unsigned char conntrack_fragholder[65536];
+    UINT conntrack_packetLen;
+    WINDIVERT_ADDRESS conntrack_addr;
+    unsigned int conntracktotalLength = 0, conntrack_progress = 0;
+    //'tis hardcoded.
+    unsigned char conntrack_should_reinject = 0, conntrackhdrLen = 0, conntrackdataOffset = 0;
+    #ifndef DOLOCALNETS
+    char conntrack_filter_str_default[] = "!tcp.Syn && !impostor and !loopback and ((inbound and tcp.SrcPort == 443 and tcp.Ack) or (outbound and tcp.DstPort == 443))\0";
+    char conntrack_filter_str_discord_vc[] = "!tcp.Syn && !impostor and !loopback and ((inbound and tcp.SrcPort == 443) or (outbound and tcp.DstPort == 443) or (outbound and tcp.DstPort > 1999 and tcp.DstPort < 2100))\0";
+    #else
+    char conntrack_filter_str_default[] = "!tcp.Syn && !impostor and (((inbound or loopback) and tcp.SrcPort == 443 and tcp.Ack) or (outbound and tcp.DstPort == 443))\0";
+    char conntrack_filter_str_discord_vc[] = "!tcp.Syn && !impostor and (((inbound or loopback) and tcp.SrcPort == 443) or (outbound and tcp.DstPort == 443) or (outbound and tcp.DstPort > 1999 and tcp.DstPort < 2100))\0";
+    #endif
+    char* conntrack_filter_str = conntrack_filter_str_default;
+    unsigned int ctrack_tcpSeq = 0;
+    void* do_conntrack() { //The backbone of advanced GoodbyeDPI functionality.
+        conntrack_filter = WinDivertOpen(conntrack_filter_str, WINDIVERT_LAYER_NETWORK, 2, 0);
+        if (conntrack_filter != INVALID_HANDLE_VALUE)
+        while (!exiting) {
+            //printf("do loop\n");
+            if (WinDivertRecv(conntrack_filter, conntrack_packet, 65536, &conntrack_packetLen, &conntrack_addr)) {
+                conntrack_should_reinject = 1;
+                //printf("recv\n");
+                conntrackhdrLen = (conntrack_packet[0] & 0xF) * 4;
+                conntrackdataOffset = (conntrack_packet[conntrackhdrLen + 12] >> 4) * 4;
+                convert_endian(&conntrack_packetLen, conntrack_packet + 2, 2);
+                //Do conntrack stuff
+                conntrack_ip = *((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) ? (unsigned int*)(conntrack_packet + 16) : (unsigned int*)(conntrack_packet + 12));
+                conntrack_seq = (conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) ? ntohl(*((unsigned int*)(conntrack_packet + conntrackhdrLen + 4))) : ntohl(*((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)));
+                #ifdef TLSDEBUG
+                if (conntrack_ip & 0x0011117F == 0x7F) printf("localhost traffic captured...\n");
+                #endif
+                //printf("Begin\n");
+                for (int i = 0; i < conntrack_curlen; i++) {
+                    //printf("i'm doing conntrack x%d\n", i);
+                    if (!conntrack[i].busy && conntrack[i].ip == conntrack_ip && (((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) ? conntrack_seq : conntrack_seq - conntrack[i].offset) >= conntrack[i].lowerseq && ((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) ? conntrack_seq : conntrack_seq - conntrack[i].offset) <= conntrack[i].upperseq)) {
+                        #ifdef TLSDEBUG
+                        printf("match!!!!\n");
+                        #endif
+                        if ((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) && (*(conntrack_packet + conntrackhdrLen + 13) & 0b00000001)) {
+                            conntrack[i].outfin = 1;
+                            conntrack[i].upperseq += 1;
+                        }
+                        else if ((*(conntrack_packet + conntrackhdrLen + 13) & 0b00000001)) {
+                            conntrack[i].infin = 1;
+                        }
+                        if (conntrack[i].infin && conntrack[i].outfin && (*(conntrack_packet + conntrackhdrLen + 13) & 0b00010000) > 0) {
+                            conntrack[i].lastack = 1;
+                            *((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)) = htonl(conntrack_seq - conntrack[i].offset);
+                        }
+                        if ((conntrack[i].lastack) || ((*(conntrack_packet + conntrackhdrLen + 13) & 0b00000100) > 0)) { //Annihilate the conntrack connection if this packet fully terminates the connection.
+                            conntrack[i].busy = 0; conntrack[i].ip = 0; conntrack[i].lowerseq = 0; 
+                            conntrack[i].upperseq = 0; conntrack[i].offset = 0; conntrack[i].originseq = 0; 
+                            conntrack[i].nextrecord = 0; conntrack[i].overloadlen = 0; conntrack[i].nextpacketid = 0;
+                            conntrack[i].outfin = 0; conntrack[i].infin = 0; conntrack[i].ccssent = 0;
+                            conntrack[i].retransmits = 0; conntrack[i].lastack = 0;
+                            #ifdef TLSDEBUG
+                            printf("annihilated%s.\n", *(conntrack_packet + conntrackhdrLen + 13) & 0b00000100 > 0 ? " [RST]" : "");
+                            #endif
+                        }
+                        else {
+                            if ((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443)) {
+                                //*((unsigned short*)(conntrack_packet + 4)) = htons(conntrack[i].nextpacketid++);
+                                newpacketid(conntrack_packet);
+                                *((unsigned int*)(conntrack_packet + conntrackhdrLen + 4)) = htonl(conntrack_seq + conntrack[i].offset);
+                                #ifdef TLSDEBUG
+                                printf("old conntrack seq: %u, new conntrack seq: %u, packet length: %u, payload length: %u\n", conntrack[i].upperseq, conntrack[i].upperseq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset), conntrack_packetLen, (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset));
+                                #endif
+                                if (no_ccs && !conntrack[i].ccssent && (conntrack_packet[conntrackhdrLen + conntrackdataOffset] == 0x14 && conntrack_packet[conntrackhdrLen + conntrackdataOffset + 1] == 3 && (conntrack_packet[conntrackhdrLen + conntrackdataOffset + 2] > 0 && conntrack_packet[conntrackhdrLen + conntrackdataOffset + 2] < 5))) {
+                                    conntrack[i].offset -= 5 + ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen + conntrackdataOffset + 3)));
+                                    conntrack_packetLen -= 5 + ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen + conntrackdataOffset + 3))); //I could've just made it subtrack 6. But the robustness calls.
+                                    memmove(conntrack_packet + conntrackhdrLen + conntrackdataOffset, conntrack_packet + conntrackhdrLen + conntrackdataOffset + 5 + ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen + conntrackdataOffset + 3))), conntrack_packetLen - conntrackhdrLen - conntrackdataOffset);
+                                    *((unsigned int*)(conntrack_packet + 2)) = htons(conntrack_packetLen);
+                                    conntrack[i].ccssent = 1;
+                                }
+                                if (conntrack_seq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset) == conntrack[i].upperseq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset)) { //A healthy packet. Connection tracking can be done safely.
+                                    if ((conntrack[i].upperseq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset)) < conntrack[i].upperseq) { //Wrapping around...
+                                        printf("Wrapping around.\n");
+                                        conntrack[i].lowerseq = conntrack[i].upperseq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset);
+                                    }
+                                    conntrack[i].upperseq += (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset);
+                                    conntrack[i].retransmits = 0;
+                                }
+                                else if (conntrack_seq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset) > conntrack[i].upperseq) //A traffic anomaly. Not something that should ever happen, but I am not hoping for everything to be valid.
+                                    conntrack[i].upperseq = conntrack_seq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset);
+                                else { //It's a retransmit. It should probably be handled somehow.
+                                    switch (conntrack[i].retransmits) {
+                                        case 0: //Try doing reverse fragmentation.
+                                            if (https_fragment_size && https_fragment_size < (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset)) {
+                                                conntrack_should_reinject = 0;
+                                                memcpy(conntrack_fragholder, conntrack_packet, conntrackhdrLen + conntrackdataOffset);
+                                                //Thinking with pointers.
+                                                memcpy(conntrack_fragholder + conntrackhdrLen + conntrackdataOffset, conntrack_packet + conntrackhdrLen + conntrackdataOffset + https_fragment_size, conntrack_packetLen - conntrackhdrLen - conntrackdataOffset - https_fragment_size);
+                                                *((unsigned int*)(conntrack_fragholder + conntrackhdrLen + 4)) = htonl(conntrack_seq + conntrack[i].offset + https_fragment_size);
+                                                *((unsigned int*)(conntrack_fragholder + 2)) = htons(conntrack_packetLen - https_fragment_size);
+                                                WinDivertHelperCalcChecksums(conntrack_fragholder, conntrack_packetLen - https_fragment_size, &conntrack_addr, 0);
+                                                WinDivertSend(conntrack_filter, conntrack_fragholder, conntrack_packetLen - https_fragment_size, NULL, &conntrack_addr);
+                                                //Now the second one.
+                                                memcpy(conntrack_fragholder + conntrackhdrLen + conntrackdataOffset, conntrack_packet + conntrackhdrLen + conntrackdataOffset, https_fragment_size);
+                                                *((unsigned int*)(conntrack_fragholder + conntrackhdrLen + 4)) = htonl(conntrack_seq + conntrack[i].offset);
+                                                *((unsigned int*)(conntrack_fragholder + 2)) = htons(https_fragment_size + conntrackhdrLen + conntrackdataOffset);
+                                                //*((unsigned short*)(conntrack_fragholder + 4)) = htons(conntrack[i].nextpacketid++);
+                                                newpacketid(conntrack_fragholder);
+                                                WinDivertHelperCalcChecksums(conntrack_fragholder, https_fragment_size + conntrackhdrLen + conntrackdataOffset, &conntrack_addr, 0);
+                                                WinDivertSend(conntrack_filter, conntrack_fragholder, https_fragment_size + conntrackhdrLen + conntrackdataOffset, NULL, &conntrack_addr);
+                                            }
+                                            break;
+                                        default: //Nothing's working, so let's fuck around and see what information we can gather.
+                                            *((unsigned short*)(conntrack_packet + 4)) = 12345; //Sign it.
+                                            *((unsigned int*)(conntrack_packet + conntrackhdrLen + 4)) = htonl(conntrack_seq - 200); //Send it in the past. See what happens.
+                                            *((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)) = htonl(ntohl(*((unsigned int*)(conntrack_packet + conntrackhdrLen + 8))) + 200); //Send it also acknowledging the future. See what happens.
+                                    }
+                                    conntrack[i].retransmits++;
+                                }
+                            }
+                            else {
+                                *((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)) = htonl(conntrack_seq - conntrack[i].offset);
+                            }
+                            #ifdef TLSDEBUG
+                            printf("I did it! for ip %u.%u.%u.%u, associated SNI %s, %s\n", ((unsigned char*)&(conntrack[i].ip))[0], ((unsigned char*)&(conntrack[i].ip))[1], ((unsigned char*)&(conntrack[i].ip))[2], ((unsigned char*)&(conntrack[i].ip))[3], conntrack[i].associatedsni, (conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) ? "Outbound" : "Inbound");
+                            #endif
+                        }
+                    }
+                    else if (conntrack[i].ip == conntrack_ip) {
+                        if (conntrack_ip == 0x0100007F) printf("partial match, direction: %s, IP: %u.%u.%u.%u, SEQs: packet: %u, origin seq: %u, conntrack lower bound: %u, conntrack upper bound: %u, offset: %u\n", ((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443)) ? "Outbound" : "Inbound", ((unsigned char*)&(conntrack[i].ip))[0], ((unsigned char*)&(conntrack[i].ip))[1], ((unsigned char*)&(conntrack[i].ip))[2], ((unsigned char*)&(conntrack[i].ip))[3], conntrack_seq, conntrack[i].originseq, conntrack[i].lowerseq, conntrack[i].upperseq, conntrack[i].offset);
+                        if ((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) && conntrack_seq > conntrack[i].upperseq && conntrack_seq - conntrack[i].upperseq < 600) printf("proximity alert, this likely means a missed packet and conntrack is failing. (%s)\n", (conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) ? "Outbound" : "Inbound");
+                        if ((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) && conntrack_seq < conntrack[i].lowerseq && conntrack_seq >= conntrack[i].originseq) { //An evil retransmit. block it so it doesn't clobber everything.
+                            conntrack_should_reinject = 0;
+                            #ifdef TLSDEBUG
+                            printf("Retransmit blocked\n");
+                            #endif
+                        }
+                        if (!(conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) && conntrack_seq > conntrack[i].originseq && conntrack_seq < conntrack[i].lowerseq) { //Early ACK, it should not be received. Block it.
+                            conntrack_should_reinject = 0;
+                            #ifdef TLSDEBUG
+                            printf("Early ACK blocked\n");
+                            #endif
+                        }
+                    }
+                }
+                /*if (*(conntrack_packet + conntrackhdrLen + 13) == 0b00000010 && conntrack_addr.Outbound && mss > 0) {
+                    printf("MSS!\n");
+                    findmss = 0;
+                    //Locate the MSS option.
+                    for (int i = 0; i < conntrackdataOffset; i += conntrack_packet[conntrackhdrLen + i] > 1 ? ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen + i + 1))) : 1) { //Actually cramming logic in there. Amazing.
+                        if (conntrack_packet[conntrackhdrLen + i] == 2) {
+                            findmss = i + 2;
+                            break;
+                        }
+                    }
+                    if (findmss != 0) {
+                        *((unsigned short*)(conntrack_packet + conntrackhdrLen + findmss)) = htons(mss);
+                    }
+                    else { //If there isn't one, make one.
+                        //Make space for the MSS option.
+                        memmove(conntrack_packet + conntrackhdrLen + conntrackdataOffset + 4, conntrack_packet + conntrackhdrLen + conntrackdataOffset, conntrack_packetLen - conntrackdataOffset - conntrackhdrLen);
+                        //Attach MSS Option to packet, overwrite options terminator.
+                        conntrack_packet[conntrackhdrLen + conntrackdataOffset - 1] = 2;
+                        conntrack_packet[conntrackhdrLen + conntrackdataOffset] = 4;
+                        *((unsigned short*)(conntrack_packet + conntrackhdrLen + conntrackdataOffset + 1)) = htons(mss);
+                        //Make a new options terminator.
+                        conntrack_packet[conntrackhdrLen + conntrackdataOffset + 3] = 0;
+                        conntrack_packet[conntrackhdrLen + 12] += 0x10;
+                    }
+                    WinDivertHelperCalcChecksums(conntrack_packet, conntrack_packetLen, &conntrack_addr, 0);
+                }
+                */
+                WinDivertHelperCalcChecksums(conntrack_packet, conntrack_packetLen, &conntrack_addr, 0);
+                if (conntrack_should_reinject) {
+                    WinDivertSend(conntrack_filter, conntrack_packet, conntrack_packetLen, NULL, &conntrack_addr);
+                }
+            }
+            else {
+                printf("conntrack receive error %u\n", GetLastError());
+                break;
+            }
+        }
+        //printf("terminated\n");
     }
     // Make sure to search DLLs only in safe path, not in current working dir.
     SetDllDirectory("");
@@ -1331,8 +2295,17 @@ int main(int argc, char *argv[]) {
             case 'p':
                 do_passivedpi = 1;
                 break;
+            case 'P': // --rplrr
+                rplrr = 1;
+                break;
+            case 'N': // --cleave-sni
+                cleave_sni = 1;
+                break;
             case 'q':
                 do_block_quic = 1;
+                break;
+            case 'Q': // --reverse-fix
+                reverse_fix = 1;
                 break;
             case 'r':
                 do_host = 1;
@@ -1349,16 +2322,16 @@ int main(int argc, char *argv[]) {
                 break;
             case 'h':
                 smart_frag = 1;
-                break;
-            case 'X':
-                fatass = 1;
-                MTU = atousi(optarg, "Could not assign MTU!");
+                if (!ext_frag_size) ext_frag_size = 4;
                 break;
             case 'm':
                 do_host_mixedcase = 1;
                 break;
+            case 'C': // --tls-recseg-size
+                tls_recseg_size = atousi(optarg, "Fragment size should be in range [0 - 65535]\n");
+                break;
             case '-': // --discord-vc
-                const char *tcp = " or (tcp and !impostor and !loopback " MAXPAYLOADSIZE_TEMPLATE " and " \
+                const char *tcp = " or (outbound and tcp and !impostor and !loopback " MAXPAYLOADSIZE_TEMPLATE " and " \
                                   "(tcp.DstPort > 1999 and tcp.DstPort < 2100))";
                 char *current_filter = filter_string;
                 size_t new_filter_size = strlen(current_filter) + strlen(tcp) + 16;
@@ -1372,11 +2345,11 @@ int main(int argc, char *argv[]) {
                 activate_thrash = 1;
                 if (!optarg && argv[optind] && argv[optind][0] != '-')
                     optarg = argv[optind];
-                //printf("Shit: %u\n", atousi(optarg, "UDP Fake packet assignment error!"));
                 if (optarg && atousi(optarg, "UDP Fake packet assignment error!") > 0)
                     udp_fakes = atousi(optarg, "UDP Fake packet assignment error!");
                 else
                     udp_fakes = 1;
+                conntrack_filter_str = conntrack_filter_str_discord_vc;
                 break;
             case 'd': // --dns-addr
                 if ((inet_pton(AF_INET, optarg, dns_temp_addr.s6_addr) == 1) &&
@@ -1394,6 +2367,10 @@ int main(int argc, char *argv[]) {
                 puts("DNS address parameter error!");
                 exit(ERROR_DNS_V4_ADDR);
                 break;
+            case 'J': // --mss
+                mss = atousi(optarg, "MSS should be in range [0 - 65535]\n");
+                synning = 1;
+                break;
             case 'f':
                 do_fragment_http = 1;
                 SET_HTTP_FRAGMENT_SIZE_OPTION(atousi(optarg, "Fragment size should be in range [0 - 0xFFFF]\n"));
@@ -1405,6 +2382,9 @@ int main(int argc, char *argv[]) {
                 do_fragment_http_persistent = 1;
                 do_native_frag = 1;
                 SET_HTTP_FRAGMENT_SIZE_OPTION(atousi(optarg, "Fragment size should be in range [0 - 0xFFFF]\n"));
+                break;
+            case 'K':
+                host_shiftback = atoi(optarg);
                 break;
             case 'n':
                 do_fragment_http_persistent = 1;
@@ -1437,6 +2417,9 @@ int main(int argc, char *argv[]) {
             case 'w':
                 do_http_allports = 1;
                 break;
+            case 'V': // --vortex-frag-by-sni
+                vortex_frag_by_sni = 1;
+                break;
             case 'z': // --port
                 /* i is used as a temporary variable here */
                 i = atoi(optarg);
@@ -1448,11 +2431,24 @@ int main(int argc, char *argv[]) {
                     add_filter_str(IPPROTO_TCP, i);
                 i = 0;
                 break;
+            case 'Z':
+                disable_sack = 1;
+                synning = 1;
+                break;
             case 'i': // --ip-id
                 /* i is used as a temporary variable here */
                 i = atousi(optarg, "IP ID parameter error!\n");
                 add_ip_id_str(i);
                 i = 0;
+                break;
+            case 'I': // --fragnt
+                fragnt = 1;
+                break;
+            case 'A':
+                vortex_step_left = atousi(optarg, "Step bias should be in range [1 - 4]\n") > 0 ? atousi(optarg, "Step bias should be in range [1 - 4]\n") : 1;
+                break;
+            case 'D':
+                vortex_step_right = atousi(optarg, "Step bias should be in range [1 - 4]\n") > 0 ? atousi(optarg, "Step bias should be in range [1 - 4]\n") : 1;
                 break;
             case 'M':
                 tls_segment_size = atousi(optarg, "Fragment size should be in range [0 - 65535]\n");
@@ -1489,6 +2485,11 @@ int main(int argc, char *argv[]) {
             case ';': //tls-force-native
                 tls_force_native = 1;
                 break;
+            case 'E': // --record-frag
+                record_frag = 1;
+                conntrack_maxlen = (atousi(optarg, "Connection tracking buffer sizing error!") > 0 ? atousi(optarg, "Connection tracking buffer sizing error!") : 1024);
+                doing_conntrack = 1;
+                break;
             case '@': // --dnsv6-port
                 if (!do_dnsv6_redirect) {
                     puts("--dnsv6-port should be used with --dnsv6-addr!\n"
@@ -1518,6 +2519,8 @@ int main(int argc, char *argv[]) {
             case '>': // --frag-by-sni
                 do_fragment_by_sni = 1;
                 break;
+            case 'R': // --tls-rando-frag
+                tls_rando_frag = 1;
             case '$': // --set-ttl
                 do_auto_ttl = auto_ttl_1 = auto_ttl_2 = auto_ttl_max = 0;
                 do_fake_packet = 1;
@@ -1565,6 +2568,9 @@ int main(int argc, char *argv[]) {
                 do_fake_packet = 1;
                 do_wrong_chksum = 1;
                 break;
+            case 'S': // --rplrr-by-sni
+                rplrr = 1;
+                rplrr_by_sni = 1;
             case ')': // --wrong-seq
                 do_fake_packet = 1;
                 do_wrong_seq = 1;
@@ -1573,6 +2579,9 @@ int main(int argc, char *argv[]) {
                 do_native_frag = 1;
                 do_fragment_http_persistent = 1;
                 do_fragment_http_persistent_nowait = 1;
+                break;
+            case 'G': // --allow-sni-overlap
+                allow_sni_overlap = 1;
                 break;
             case '(': // --reverse-frag
                 do_reverse_frag = 1;
@@ -1586,7 +2595,7 @@ int main(int argc, char *argv[]) {
             case '=': // --ext-frag-size
                 if (!optarg && argv[optind] && argv[optind][0] != '-')
                     optarg = argv[optind];
-                ext_frag_size = (atousi(optarg, "Extension fragment size parameter error!") > 1 ? atousi(optarg, "\0") : 0);
+                ext_frag_size = (atousi(optarg, "Extension fragment size parameter error!") > 0 ? atousi(optarg, "\0") : 0);
                 break;
             case 'b': // --tls-segmentation
                 tls_segmentation = (atousi(optarg, "TLS Record segment amount parameter error!") > 1 ? atousi(optarg, "\0") : 0);
@@ -1672,9 +2681,6 @@ int main(int argc, char *argv[]) {
                 "                          may fix some websites.\n"
                 " --tls-segmentation <value>  Splits the other parts of the TLS record into <value> equally sized\n"
                 "                             segments. Won't do anything with SNI fragmentation disabled.\n"
-                " --fatass <MTU>           Catches fat as shit TLS ClientHellos, may or may not be useful.\n"
-                "                          FYI, googlevideo.com servers need fat as shit TLS ClientHellos.\n"
-                "                          No, I'm not gonna change the name. If you come up with a better one, tell me.\n"
                 " --compound-frag          Uses vanilla HTTPS splitting and SNI fragmentation at the same time on\n"
                 "                          TLS ClientHello packets.\n"
                 " --native-frag            fragment (split) the packets by sending them in smaller packets, without\n"
@@ -1745,29 +2751,31 @@ int main(int argc, char *argv[]) {
            "TLS Native Fragmentation: %u\n"         /* 9 */
            "TLS Record Segments: %u\n"              /* 10 */
            "TLS Absolute Fragmentation: %u\n"       /* 11 */
-           "Compound Fragmentation: %u\n"           /* 12 */
+           "TLS Random Fragmentation: %u\n"         /* 12 */
+           "TLS Smart Fragmentation: %u (Extension fragment size: %u)\n" /* 13 */
+           "Compound Fragmentation: %u\n"           /* 14 */
            //#ifdef UDPTEST
-           //"UDP fragments: %u\n"                  /* 13 */
+           //"UDP fragments: %u\n"                  /* 15 */
            //#endif
-           "Native fragmentation (splitting): %d\n" /* 14 */
-           "Fragments sending in reverse: %d\n"     /* 15 */
-           "hoSt: %d\n"                             /* 16 */
-           "Host no space: %d\n"                    /* 17 */
-           "Additional space: %d\n"                 /* 18 */
-           "Mix Host: %d\n"                         /* 19 */
-           "HTTP AllPorts: %d\n"                    /* 20 */
-           "HTTP Persistent Nowait: %d\n"           /* 21 */
-           "Fix Discord VC: %u (Fake packets: %u)\n"/* 22 */
-           "DNS redirect: %d\n"                     /* 23 */
-           "DNSv6 redirect: %d\n"                   /* 24 */
-           "Drop unsecure DNS: %d\n"                /* 25 */
-           "Allow missing SNI: %d\n"                /* 26 */
-           "Fake requests, TTL: %s (fixed: %hu, auto: %hu-%hu-%hu, min distance: %hu)\n"  /* 27 */
-           "Fake requests, wrong checksum: %d\n"    /* 28 */
-           "Fake requests, wrong SEQ/ACK: %d\n"     /* 29 */
-           "Fake requests, custom payloads: %d\n"   /* 30 */
-           "Fake requests, resend: %d\n"            /* 31 */
-           "Max payload size: %hu\n",               /* 32 */
+           "Native fragmentation (splitting): %d\n" /* 16 */
+           "Fragments sending in reverse: %d\n"     /* 17 */
+           "hoSt: %d\n"                             /* 18 */
+           "Host no space: %d\n"                    /* 19 */
+           "Additional space: %d\n"                 /* 20 */
+           "Mix Host: %d\n"                         /* 21 */
+           "HTTP AllPorts: %d\n"                    /* 22 */
+           "HTTP Persistent Nowait: %d\n"           /* 23 */
+           "Fix Discord VC: %u (Fake packets: %u)\n"/* 24 */
+           "DNS redirect: %d\n"                     /* 25 */
+           "DNSv6 redirect: %d\n"                   /* 26 */
+           "Drop unsecure DNS: %d\n"                /* 27 */
+           "Allow missing SNI: %d\n"                /* 28 */
+           "Fake requests, TTL: %s (fixed: %hu, auto: %hu-%hu-%hu, min distance: %hu)\n"  /* 29 */
+           "Fake requests, wrong checksum: %d\n"    /* 30 */
+           "Fake requests, wrong SEQ/ACK: %d\n"     /* 31 */
+           "Fake requests, custom payloads: %d\n"   /* 32 */
+           "Fake requests, resend: %d\n"            /* 33 */
+           "Max payload size: %hu\n",               /* 34 */
            do_passivedpi,                          /* 1 */ 
            do_block_quic,                          /* 2 */
            (do_fragment_http ? http_fragment_size : 0),           /* 3 */
@@ -1779,33 +2787,44 @@ int main(int argc, char *argv[]) {
            tls_force_native,      /* 9 */
            tls_segmentation,      /* 10 */
            tls_absolute_frag,     /* 11 */
-           compound_frag,         /* 12 */
+           tls_rando_frag,        /* 12 */
+           smart_frag, ext_frag_size, /* 13 */
+           compound_frag,         /* 13 */
            //#ifdef UDPTEST
-           //udp_fragments,       /* 13 */
+           //udp_fragments,       /* 14 */
            //#endif
-           do_native_frag,        /* 14 */
-           do_reverse_frag,       /* 15 */
-           do_host,               /* 16 */
-           do_host_removespace,   /* 17 */
-           do_additional_space,   /* 18 */
-           do_host_mixedcase,     /* 19 */
-           do_http_allports,      /* 20 */
-           do_fragment_http_persistent_nowait, /* 21 */
-           activate_thrash, udp_fakes,         /* 22 */
-           do_dnsv4_redirect,                  /* 23 */
-           do_dnsv6_redirect,                  /* 24 */
-           drop_unsecure_dns,                  /* 25 */
-           do_allow_no_sni,                    /* 26 */
-           do_auto_ttl ? "auto" : (do_fake_packet ? "fixed" : "disabled"),  /* 27 */
+           do_native_frag,        /* 15 */
+           do_reverse_frag,       /* 16 */
+           do_host,               /* 17 */
+           do_host_removespace,   /* 18 */
+           do_additional_space,   /* 19 */
+           do_host_mixedcase,     /* 20 */
+           do_http_allports,      /* 21 */
+           do_fragment_http_persistent_nowait, /* 22 */
+           activate_thrash, udp_fakes,         /* 23 */
+           do_dnsv4_redirect,                  /* 24 */
+           do_dnsv6_redirect,                  /* 25 */
+           drop_unsecure_dns,                  /* 26 */
+           do_allow_no_sni,                    /* 27 */
+           do_auto_ttl ? "auto" : (do_fake_packet ? "fixed" : "disabled"),  /* 28 */
                ttl_of_fake_packet, do_auto_ttl ? auto_ttl_1 : 0, do_auto_ttl ? auto_ttl_2 : 0,
                do_auto_ttl ? auto_ttl_max : 0, ttl_min_nhops,
-           do_wrong_chksum, /* 28 */
-           do_wrong_seq,    /* 29 */
-           fakes_count,     /* 30 */
-           fakes_resend,    /* 31 */
-           max_payload_size /* 32 */
+           do_wrong_chksum, /* 29 */
+           do_wrong_seq,    /* 30 */
+           fakes_count,     /* 31 */
+           fakes_resend,    /* 32 */
+           max_payload_size /* 33 */
           );
-
+    
+    if (tls_rando_frag && sni_fragment_size) {
+        puts("\nINFO: SNI Fragment size specified with TLS Random Fragmentation.\n"
+            "SNI Fragment size overrides random SNI fragment sizes.");
+    }
+    if (tls_absolute_frag && sni_fragment_size) {
+        puts("\nINFO: SNI Fragment size specified with TLS Absolute Fragmentation.\n"
+            "SNI Fragment size overrides TLS fragment sizes while fragmenting the SNI.");
+    }
+    if (smart_frag && !ext_frag_size) ext_frag_size = 1;
     if (do_fragment_http && http_fragment_size > 2 && !do_native_frag) {
         puts("\nWARNING: HTTP fragmentation values > 2 are not fully compatible "
              "with other options. Please use values <= 2 or disable HTTP fragmentation "
@@ -1815,7 +2834,7 @@ int main(int argc, char *argv[]) {
         "\nWARNING: Compound fragmentation is enabled but SNI fragmentation is not enabled.\n"
         "Compound fragmentation is not done."
     );
-    if (tls_absolute_frag && (compound_frag || sni_fragment_size || tls_segment_size || tls_segmentation)) {
+    if (tls_absolute_frag && (compound_frag || tls_segment_size || tls_segmentation)) {
         puts(
             "\nWARNING: You tried to use TLS Absolute Fragmentation with other related options.\n"
             "The actions related to those options are not being done."
@@ -1834,12 +2853,18 @@ int main(int argc, char *argv[]) {
              "Fragmentation has no effect.");
         die();
     }
-
+    pthread_t thrash_thread, conntrack_thread, synner_thread;
     if (max_payload_size) add_maxpayloadsize_str(max_payload_size);
     finalize_filter_strings();
-    pthread_t thrash_thread;
     if (activate_thrash) {
         pthread_create(&thrash_thread, NULL, thrash, NULL);
+    }
+    if (conntrack_maxlen) {
+        conntrack = calloc(conntrack_maxlen, sizeof(struct conntracksig));
+        pthread_create(&conntrack_thread, NULL, do_conntrack, NULL);
+    }
+    if (synning) {
+        pthread_create(&synner_thread, NULL, synner, NULL);
     }
     puts("\nOpening filter");
     filter_num = 0;
@@ -1867,7 +2892,7 @@ int main(int argc, char *argv[]) {
      * active DPI circumvention
      */
     filters[filter_num] = init(filter_string, 0);
-    //printf("My filter is %s", filter_string);
+    printf("My filter is %s\n", filter_string);
     w_filter = filters[filter_num];
     filter_num++;
 
@@ -1877,11 +2902,12 @@ int main(int argc, char *argv[]) {
     }
     printf("Filter activated, GoodbyeDPI is now running!\n");
     signal(SIGINT, sigint_handler);
+    signal(SIGSEGV, sigsegv_handler);
     unsigned char* compound_fragHolder = (unsigned char*) malloc(https_fragment_size);
 
     while (1) {
         proceed = 0;
-        if (WinDivertRecv(w_filter, packet, sizeof(packet), &packetLen, &addr)) {
+        if (WinDivertRecv(w_filter, realpacket, sizeof(realpacket), &packetLen, &addr)) {
             debug("Got %s packet, len=%d!\n", addr.Outbound ? "outbound" : "inbound",
                    packetLen);
             should_reinject = 1;
@@ -1893,9 +2919,10 @@ int main(int argc, char *argv[]) {
             ppUdpHdr = (PWINDIVERT_UDPHDR)NULL;
             packet_v4 = packet_v6 = 0;
             packet_type = unknown;
+            packet = realpacket;
             // Parse network packet and set it's type
-            if (WinDivertHelperParsePacket(packet, packetLen, &ppIpHdr,
-                &ppIpV6Hdr, NULL, NULL, NULL, &ppTcpHdr, &ppUdpHdr, &packet_data, &packet_dataLen,
+            if (WinDivertHelperParsePacket(realpacket, packetLen, &ppIpHdr,
+                &ppIpV6Hdr, NULL, NULL, NULL, &ppTcpHdr, &ppUdpHdr, (void**)&packet_data, &packet_dataLen,
                 NULL, NULL))
             {
                 if (ppIpHdr) {
@@ -1925,84 +2952,109 @@ int main(int argc, char *argv[]) {
             }
             debug("packet_type: %d, packet_v4: %d, packet_v6: %d\n", packet_type, packet_v4, packet_v6);
             if (packet_type == ipv4_tcp_data || packet_type == ipv6_tcp_data) {
-                //Check if packet matches one of the TLS ClientHellos being searched for, increment the lifetime of other incomplete ClientHellos.
-                if (addr.Outbound && ppTcpHdr->DstPort != htons(80) && (tls_segment_size || tls_segmentation) && fatass) {
-                    acted = 0;
-                    for (int i = 0; i < 25; i++) {
-                        if (clientHelloSearch[i].seq != 0 && clientHelloSearch[i].seq == ntohl(ppTcpHdr->SeqNum) && clientHelloSearch[i].ip == *(unsigned int*)(packet + 16)) {
-                            printf("MATCH!\n");
-                            //We found a match, now do whatever we were supposed to do to it.
-                            hdrLen = (packet[0] & 0b00001111) * 4;
-                            dataOffset = (packet[hdrLen + 12] >> 4) * 4;
-                            memcpy(fragmentHolder, packet, hdrLen + dataOffset);
-                            convert_endian(&tcpBaseSeq, packet + hdrLen + 4, 4);
-                            tcpBaseSeqTrue = tcpBaseSeq;
-                            if (tls_segment_size || tls_absolute_frag) {
-                                if (tls_absolute_frag > 0) current_fragment_size = tls_absolute_frag;
-                                else current_fragment_size = tls_segment_size;
-                                for (int x = (do_reverse_frag && !tls_force_native) ? ((packetLen - hdrLen - dataOffset) / current_fragment_size * current_fragment_size) : 0; (x < (packetLen - hdrLen - dataOffset) && (!do_reverse_frag || tls_force_native)) || ((do_reverse_frag && !tls_force_native) && x >= 0); (do_reverse_frag && !tls_force_native) ? (x -= current_fragment_size) : (x += current_fragment_size)) {
-                                    totalLength = (x + current_fragment_size > (packetLen - hdrLen - dataOffset) ? (packetLen - hdrLen - dataOffset) % current_fragment_size : current_fragment_size) + hdrLen + dataOffset;
-                                    tcpSeq = tcpBaseSeq + x;
-                                    convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
-                                    memcpy(fragmentHolder + hdrLen + dataOffset, packet + (tcpSeq - tcpBaseSeq) + hdrLen + dataOffset, totalLength - hdrLen - dataOffset);
-                                    convert_endian(fragmentHolder + 2, &totalLength, 2);
-                                    newpacketid(fragmentHolder);
-                                    WinDivertHelperCalcChecksums(
-                                        fragmentHolder, totalLength, &addr, 0
-                                    );
-                                    //reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeqTrue, packet + hdrLen + dataOffset);
-                                    WinDivertSend(
-                                        w_filter, fragmentHolder,
-                                        totalLength,
-                                        NULL, &addr
-                                    );
-                                }
-                            }
-                            else if (tls_segmentation) {
-                                for (int x = (do_reverse_frag && !tls_force_native) ? tls_segmentation - 1 : 0; (x < tls_segmentation && (!do_reverse_frag || tls_force_native)) || ((do_reverse_frag && !tls_force_native) && x >= 0); (do_reverse_frag && !tls_force_native) ? x-- : x++) {
-                                    totalLength = (packetLen - hdrLen - dataOffset) / tls_segmentation + hdrLen + dataOffset;
-                                    tcpSeq = tcpBaseSeq + ((totalLength - hdrLen - dataOffset) * x);
-                                    totalLength += (x + 1 == tls_segmentation ? ((packetLen - hdrLen - dataOffset) % tls_segmentation) : 0);
-                                    //printf("SEGMENT %d, PAYLOAD LENGTH: %u, SEQ OFFSET: %u\n", x + 1, totalLength - hdrLen - dataOffset, tcpSeq - tcpBaseSeq);
-                                    convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
-                                    memcpy(fragmentHolder + hdrLen + dataOffset, packet + (tcpSeq - tcpBaseSeq) + hdrLen + dataOffset, totalLength - hdrLen - dataOffset);
-                                    convert_endian(fragmentHolder + 2, &totalLength, 2);
-                                    newpacketid(fragmentHolder);
-                                    WinDivertHelperCalcChecksums(
-                                        fragmentHolder, totalLength, &addr, 0
-                                    );
-                                    //reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeqTrue, packet + hdrLen + dataOffset);
-                                    WinDivertSend(
-                                        w_filter, fragmentHolder,
-                                        totalLength,
-                                        NULL, &addr
-                                    );
-                                }
-                            }
-                            clientHelloSearch[i].seq = 0;
-                            acted = 1;
-                            /*
-                            xprint(packet + hdrLen + dataOffset, packetLen - dataOffset - hdrLen, 40);
-                            printf("\n\n");
-                            xprint(reassembleSegments, packetLen - dataOffset - hdrLen, 40);
-                            printf("\n");
-                            differentiate(packet + hdrLen + dataOffset, packetLen - dataOffset - hdrLen, reassembleSegments, packetLen - dataOffset - hdrLen, 0);
-                            */
-                            break;
-                        }
-                        if (clientHelloSearch[i].seq != 0 && clientHelloSearch[i].life + 1 == 75) {
-                            #ifdef DEBUG
-                            printf("SEQ %u, IP: %u.%u.%u.%u Has expired.\n", clientHelloSearch[i].seq, ((unsigned char*)&(clientHelloSearch[i].ip))[0], ((unsigned char*)&(clientHelloSearch[i].ip))[1], ((unsigned char*)&(clientHelloSearch[i].ip))[2], ((unsigned char*)&(clientHelloSearch[i].ip))[2]);
-                            #endif
-                            clientHelloSearch[i].seq = 0; //Destroy the waiting ClientHello that's lived for too long.
-                        }
-                        else clientHelloSearch[i].life++;
-                    }
-                    if (acted) continue;
-                }
                 //printf("Got parsed packet, len=%d!\n", packet_dataLen);
                 /* Got a TCP packet WITH DATA */
-
+                //If it's a TLS record, is a ClientHello and the record is larger than the packet itself, attempt reassembly of the record.
+                if (addr.Outbound && ppTcpHdr->DstPort != htons(80)) {
+                    hdrLen = (packet[0] & 0b00001111) * 4;
+                    dataOffset = (packet[hdrLen + 12] >> 4) * 4;
+                    unsigned int ip = *(unsigned int*)(packet + 16);
+                    unsigned int seq = ntohl(*((unsigned int*)(packet + hdrLen + 4)));
+                    freeWaiting = -1;
+                    for (int i = 0; i < fatasslen; i++) {
+                        if (fatass[i].ip == ip && freeWaiting == -1) {
+                            if (fatass[i].seq == seq) {
+                                freeWaiting = i;
+                            }
+                            else if (fatass[i].originseq = seq) {
+                                freeWaiting = -2;
+                                should_reinject = 0;
+                            }
+                        }
+                        fatass[i].life++;
+                        if (fatass[i].life > FATASSMAXLIFE) {
+                            fatass[i].ip = 0;
+                            fatass[i].seq = 0;
+                        }
+                    }
+                    if (freeWaiting >= 0) {
+                        memcpy(fatass[freeWaiting].packet + fatass[freeWaiting].recordlength + fatass[freeWaiting].iphdrlen + fatass[freeWaiting].dOffset, packet_data, packet_dataLen);
+                        fatass[freeWaiting].recordlength += packet_dataLen;
+                        fatass[freeWaiting].seq += packet_dataLen;
+                        if (fatass[freeWaiting].recordlength == fatass[freeWaiting].expectedlength) {
+                            printf("Packet completed..\n");
+                            packet = fatass[freeWaiting].packet;
+                            *((unsigned short*)(packet + 2)) = htons(fatass[freeWaiting].recordlength + fatass[freeWaiting].iphdrlen + fatass[freeWaiting].dOffset);
+                            packetLen = fatass[freeWaiting].recordlength + fatass[freeWaiting].iphdrlen + fatass[freeWaiting].dOffset;
+                            packet_dataLen = fatass[freeWaiting].recordlength;
+                            packet_data = packet + fatass[freeWaiting].iphdrlen + fatass[freeWaiting].dOffset;
+                            sni_ok = extract_sni(packet_data, packet_dataLen,
+                                        &host_addr, &host_len);
+                            if (!sni_ok) { //Well that was in vain. Oh well. Fragment the packet the old fashioned way. Should be easy enough.
+                                memcpy(fragmentHolder, packet, hdrLen + dataOffset);
+                                progress = 0;
+                                fragmentInfoLen = 0;
+                                tcpBaseSeq = ntohl(*((unsigned int*)(packet + hdrLen + 4)));
+                                while (progress != packet_dataLen) {
+                                    current_fragment_size = 500;
+                                    if (hdrLen + dataOffset + progress + current_fragment_size >= packetLen) { //Uh oh.
+                                        current_fragment_size = (unsigned int) (packetLen - hdrLen - dataOffset - progress);
+                                        break;
+                                    }
+                                    memcpy(fragmentHolder + hdrLen + dataOffset, packet + hdrLen + dataOffset + progress, current_fragment_size);
+                                    totalLength = hdrLen + dataOffset + current_fragment_size;
+                                    convert_endian(fragmentHolder + 2, &totalLength, 2);
+                                    tcpSeq = tcpBaseSeq + progress;
+                                    convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
+                                    newpacketid(fragmentHolder);
+                                    WinDivertHelperCalcChecksums(
+                                        fragmentHolder, totalLength, &addr, 0
+                                    );
+                                    if (!super_reverse)
+                                    WinDivertSend(
+                                        w_filter, fragmentHolder,
+                                        totalLength,
+                                        NULL, &addr
+                                    );
+                                    else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
+                                    progress += current_fragment_size;
+                                }
+                                do_super_reverse_frag(0, fragmentInfo, fragmentInfoLen, packet, tcpBaseSeq);
+                                should_reinject = 0;
+                            }
+                        }
+                        fatass[freeWaiting].seq = 0;
+                        fatass[freeWaiting].ip = 0;
+                    }
+                    else if (freeWaiting == -1 && packet_dataLen > 41) {
+                        if (istlshandshake(packet_data) && packet_data[5] == 1 && (ntohs(*((unsigned short*)(packet_data + 3))) + 5) > packet_dataLen) {
+                            printf("Attempting reconstruction of record with the PDU size of %u\n", ntohs(*((unsigned short*)(packet_data + 3))) + 5);
+                            for (int i = 0; i < fatasslen; i++) {
+                                if (fatass[i].seq == 0 && fatass[i].ip == 0) {
+                                    freeWaiting = i;
+                                    break;
+                                }
+                            }
+                            if (fatasslen == 512 && freeWaiting == -1) {
+                                printf("SHIT SHIT SHIT SHIT SHIT SHIT!!!\n");
+                                printf("P.S. If you see this and the program is still running, restart the program.\n");
+                            }
+                            if (freeWaiting == -1) {
+                                freeWaiting = fatasslen++;
+                            }
+                            fatass[freeWaiting].ip = ip;
+                            fatass[freeWaiting].originseq = seq;
+                            fatass[freeWaiting].seq = seq + packet_dataLen;
+                            fatass[freeWaiting].iphdrlen = hdrLen;
+                            fatass[freeWaiting].dOffset = dataOffset;
+                            fatass[freeWaiting].expectedlength = ntohs(*((unsigned short*)(packet_data + 3))) + 5;
+                            fatass[freeWaiting].recordlength = packet_dataLen;
+                            memcpy(fatass[freeWaiting].packet, packet, hdrLen + dataOffset);
+                            memcpy(fatass[freeWaiting].packet + hdrLen + dataOffset, packet_data, packet_dataLen);
+                            should_reinject = 0;
+                        }
+                    }
+                }
                 /* Handle INBOUND packet with data and find HTTP REDIRECT in there */
                 if (!addr.Outbound && packet_dataLen > 16) {
                     /* If INBOUND packet with DATA (tcp.Ack) */
@@ -2177,68 +3229,14 @@ int main(int argc, char *argv[]) {
                         } //Proceed
                     } /* if (find_header_and_get_info http_host) */
                 } /* Handle OUTBOUND packet with data */
-                if (sni_ok && (sni_fragment_size || tls_absolute_frag)) {
-                    should_recalc_checksum = 1; //Signal to native fragmentation handler
-                }
                 /*
                 * should_recalc_checksum mean we have detected a packet to handle and
                 * modified it in some way.
                 * Handle native fragmentation here, incl. sending the packet.
                 */
-                if (smart_frag && should_reinject && !proceed && do_native_frag && !((tls_absolute_frag || sni_fragment_size) && sni_ok && packet_v4) && ((unsigned char*)packet_data)[0] == 0x16 && ((unsigned char*)packet_data)[1] == 0x3 && (((unsigned char*)packet_data)[2] > 0x0 && ((unsigned char*)packet_data)[2] < 0x5) && ((unsigned char*)packet_data)[5] == 0x1 && ((unsigned char*)packet_data)[9] == 0x3 && (((unsigned char*)packet_data)[10] > 0x0 && ((unsigned char*)packet_data)[10] < 0x5)) {
-                    #ifdef DEBUG
-                    printf("BEGIN GENERIC SMART FRAGMENTATION\n");
-                    #endif
-                    hdrLen = (packet[0] & 0b00001111) * 4;
-                    dataOffset = (packet[hdrLen + 12] >> 4) * 4;
-                    convert_endian(&tcpBaseSeq, packet + hdrLen + 4, 4);
-                    memcpy(fragmentHolder, packet, hdrLen + dataOffset);
-                    for (int i = 0; i < MAX_PACKET_SIZE; i++) reassembleSegments[i] = 255u;
-                    for (int i = do_reverse_frag ? 5 : 0; (do_reverse_frag && i >= 0) || (!do_reverse_frag && i < 6); do_reverse_frag ? i-- : i++) {
-                        memcpy(fragmentHolder + hdrLen + dataOffset, packet + hdrLen + dataOffset + (2 * i), 2);
-                        tcpSeq = tcpBaseSeq + (2 * i);
-                        totalLength = hdrLen + dataOffset + 2;
-                        convert_endian(fragmentHolder + 2, &totalLength, 2);
-                        convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
-                        newpacketid(fragmentHolder);
-                        WinDivertHelperCalcChecksums(
-                            fragmentHolder, totalLength, &addr, 0
-                        );
-                        #ifdef DEBUG
-                        reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, packet + hdrLen + dataOffset);
-                        #endif
-                        WinDivertSend(
-                            w_filter, fragmentHolder,
-                            totalLength,
-                            NULL, &addr
-                        );
-                    }
-                    memcpy(fragmentHolder + hdrLen + dataOffset, packet + hdrLen + dataOffset + 12, packetLen - hdrLen - dataOffset - 12);
-                    tcpSeq = tcpBaseSeq + 12;
-                    totalLength = packetLen - 12;
-                    convert_endian(fragmentHolder + 2, &totalLength, 2);
-                    convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
-                    newpacketid(fragmentHolder);
-                    WinDivertHelperCalcChecksums(
-                        fragmentHolder, totalLength, &addr, 0
-                    );
-                    #ifdef DEBUG
-                    reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, packet + hdrLen + dataOffset);
-                    #endif
-                    WinDivertSend(
-                        w_filter, fragmentHolder,
-                        totalLength,
-                        NULL, &addr
-                    );
-                    #ifdef DEBUG
-                    xprint(packet + hdrLen + dataOffset, packetLen - dataOffset - hdrLen, 40);
-                    printf("\n\n");
-                    xprint(reassembleSegments, packetLen - dataOffset - hdrLen, 40);
-                    printf("\n");
-                    differentiate(packet + hdrLen + dataOffset, packetLen - dataOffset - hdrLen, reassembleSegments, packetLen - dataOffset - hdrLen, 0);
-                    #endif
-                    continue;
-                }
+                hdrLen = (packet[0] & 0b00001111) * 4;
+                dataOffset = (packet[hdrLen + 12] >> 4) * 4;
+
                 if (should_reinject && should_recalc_checksum && do_native_frag && !proceed)
                 {
                     current_fragment_size = 0;
@@ -2247,22 +3245,31 @@ int main(int argc, char *argv[]) {
                     }
                     else if (do_fragment_https && ppTcpHdr->DstPort != htons(80)) {
                         if (do_fragment_by_sni && sni_ok) {
-                            current_fragment_size = (void*)host_addr - packet_data;
+                            current_fragment_size = (void*)host_addr - (void*)packet_data;
                         } else {
                             current_fragment_size = https_fragment_size;
                         }
                     }
-                    if ((sni_fragment_size || tls_absolute_frag) && sni_ok && packet_v4) {
+                    if ((sni_fragment_size || tls_absolute_frag || tls_rando_frag) && sni_ok && packet_v4) {
+                        addoffset = 0;
+                        beginSni = 0;
                         fragmentInfoLen = 0;
+                        packetBACKLen = packetLen;
+                        //analyze_tls_clienthello(packet);
                         #ifdef DEBUG
                         printf("BEGIN SNI FRAGMENTATION\n");
                         #endif
+                        #ifdef SHOWSNI
+                        printf("processing ");
+                        xprint(host_addr, host_len, 0);
+                        printf("\n");
+                        #endif
+                        #ifdef OBSERVATION
+                        printf("SNI distance from BEGINNING/END: %u/%u\n", (unsigned int)(host_addr - packet) - hdrLen - dataOffset, (unsigned int)((packet + packetLen) - (host_addr + host_len)));
+                        #endif
                         //printf("PACKET LENGTH: %u\n", packetLen);
-                        hdrLen = (packet[0] & 0b00001111) * 4;
-                        dataOffset = (packet[hdrLen + 12] >> 4) * 4;
                         convert_endian(&tcpBaseSeq, packet + hdrLen + 4, 4);
                         tcpBaseSeqTrue = tcpBaseSeq;
-                        memcpy(packetBACK, packet, packetLen); //Back 'er up!
                         analyze_hlen = (packet[0] & 0b00001111) * 4;
                         analyze_dataoffset = ((packet + analyze_hlen)[12] >> 4) * 4;
                         convert_endian(&analyze_totallength, packet + 2, 2);
@@ -2270,42 +3277,140 @@ int main(int argc, char *argv[]) {
                         convert_endian(&ciphersuitelen, packet + analyze_hlen + analyze_dataoffset + 44 + session_len, 2);
                         compresslen = packet[analyze_hlen + analyze_dataoffset + 46 + session_len + ciphersuitelen];
                         convert_endian(&extlen, packet + analyze_hlen + analyze_dataoffset + session_len + ciphersuitelen + compresslen + 47, 2);
-                        if (hdrLen + dataOffset + session_len + ciphersuitelen + compresslen + extlen + extlen + 49 > MTU && (tls_segment_size || tls_segmentation) && fatass) {
-                            #ifdef DEBUG
-                            printf("Did something.\n");
-                            #endif
-                            //Search for a free waiting slot.
-                            freeWaiting = -1;
-                            for (int i = 0; i < 25; i++) {
-                                if (clientHelloSearch[i].seq == 0) {
-                                    freeWaiting = i;
-                                }
-                                if (clientHelloSearch[i].seq == tcpBaseSeq + (packetLen - hdrLen - dataOffset)) {
-                                    freeWaiting = -2;
-                                    break;
-                                }
-                            }
-                            if (freeWaiting == -1) {
-                                #ifdef DEBUG
-                                printf("Quite peculiar.\n");
-                                #endif
-                                goto exit;
-                            }
-                            else if (freeWaiting == -2) {
-                                #ifdef DEBUG
-                                printf("Duplicate!\n");
-                                #endif
-                                goto exit;
-                            }
-                            clientHelloSearch[freeWaiting].seq = tcpBaseSeq + (packetLen - hdrLen - dataOffset);
-                            clientHelloSearch[freeWaiting].ip = *(unsigned int*)(packet + 16);
-                            clientHelloSearch[freeWaiting].life = 0;
+                        for (int i = 0; i < MAX_PACKET_SIZE; i++) reassembleSegments[i] = 255;
+                        overload = 0;
+                        if (host_shiftback && host_len + host_shiftback > 0) {
+                            host_addr -= host_shiftback;
+                            host_len += host_shiftback;
                         }
-                        exit:
-                        for (int i = 0; i < MAX_PACKET_SIZE; i++) reassembleSegments[i] = 255u;
-                        if (tls_absolute_frag > 0) { 
+                        if (record_frag && ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + 3))) > packet_dataLen - 5) {
+                            //sprintf("Record overload...\n");
+                            overload = ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + 3))) - (packet_dataLen - 5);
+                        }
+                        if (alter_max_record_len) {
+                            *((unsigned short*)(packet + hdrLen + dataOffset + 3)) = htons(ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + 3))) + 6); //Increase the length of the TLS record.
+                            *((unsigned int*)(packet + hdrLen + dataOffset + 5)) = htonl(ntohl(*((unsigned int*)(packet + hdrLen + dataOffset + 5)) & 0xFFFFFF00) + 6) | 0x00000001; //Increase the length of the ClientHello.
+                            *((unsigned short*)(packet + hdrLen + dataOffset + session_len + ciphersuitelen + compresslen + 47)) = htons(ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + session_len + ciphersuitelen + compresslen + 47))) + 6); //Increase the extensions length of the ClientHello.
+                            memmove(packet + analyze_hlen + analyze_dataoffset + session_len + ciphersuitelen + compresslen + 55, packet + analyze_hlen + analyze_dataoffset + session_len + ciphersuitelen + compresslen + 49, packetLen - (analyze_hlen + analyze_dataoffset + session_len + ciphersuitelen + compresslen + 49)); //Move the extensions out of the way.
+                            *((unsigned short*)(packet + hdrLen + dataOffset + session_len + ciphersuitelen + compresslen + 49)) = htons(28); //ExtType = 28
+                            *((unsigned short*)(packet + hdrLen + dataOffset + session_len + ciphersuitelen + compresslen + 51)) = htons(2); //ExtLen = 2
+                            *((unsigned short*)(packet + hdrLen + dataOffset + session_len + ciphersuitelen + compresslen + 53)) = htons(alter_max_record_len);
+                            addoffset += 6; //Increase the conntrack offset.
+                            host_addr += 6;
+                            packetLen += 6;
+                            extlen += 6;
+                        }
+                        memcpy(packetBACK, packet, packetLen); //Back 'er up!
+                        if (record_frag && !smart_frag) {
+                            memmove(packet + hdrLen + dataOffset, packet + hdrLen + dataOffset + 5, packetLen - 5 - hdrLen - dataOffset);
+                            host_addr -= 5;
+                            packetLen -= 5;
+                            tcpBaseSeq += 5;
+                        }
+                        //analyze_tls_clienthello(packet);
+                        if (tls_rando_frag) {
                             memcpy(fragmentHolder, packet, hdrLen + dataOffset);
-                            for (int x = (do_reverse_frag && !tls_force_native) ? ((packetLen - hdrLen - dataOffset) / tls_absolute_frag * tls_absolute_frag) : 0; (x < (packetLen - hdrLen - dataOffset) && (!do_reverse_frag || tls_force_native)) || ((do_reverse_frag && !tls_force_native) && x >= 0); (do_reverse_frag && !tls_force_native) ? (x -= tls_absolute_frag) : (x += tls_absolute_frag)) {
+                            progress = 0;
+                            fragging_sni = 0;
+                            while (progress != packetLen - hdrLen - dataOffset) {
+                                try_again: //goto within a loop! Very scary!
+                                current_fragment_size = !fragging_sni ? genrand4((unsigned short) packetLen) : (sni_fragment_size || cleave_sni) ? (cleave_sni ? host_len / 2 : sni_fragment_size) : genrand2((unsigned short) packetLen);
+                                if (!fragging_sni && current_fragment_size == 0) goto try_again;
+                                if (super_reverse && !fragging_sni && !(packet + hdrLen + dataOffset + progress >= host_addr + host_len) && packet + hdrLen + dataOffset + progress + current_fragment_size >= host_addr) { //Dangerously close to SNI, fragment right before it
+                                    if (!allow_sni_overlap) current_fragment_size = (unsigned int) (host_addr - packet - dataOffset - hdrLen - progress);
+                                    fragging_sni = 1;
+                                    beginSni = fragmentInfoLen + (allow_sni_overlap ? 0 : 1);
+                                    if (!allow_sni_overlap && current_fragment_size == 0) {
+                                        beginSni--;
+                                        goto try_again;
+                                    }
+                                }
+                                if (fragging_sni && packet + hdrLen + dataOffset + progress + current_fragment_size >= host_addr + host_len) { //Exitting SNI, fragment until the end of the SNI.
+                                    if (!allow_sni_overlap) current_fragment_size = (unsigned int) (host_addr + host_len - packet - hdrLen - dataOffset - progress);
+                                    fragging_sni = 0;
+                                    endSni = fragmentInfoLen;
+                                    if (!allow_sni_overlap && current_fragment_size == 0) goto try_again;
+                                }
+                                if (hdrLen + dataOffset + progress + current_fragment_size >= packetLen) { //Uh oh.
+                                    current_fragment_size = (unsigned int) (packetLen - hdrLen - dataOffset - progress);
+                                    if (current_fragment_size == 0) goto wrapup;
+                                }
+                                memcpy(fragmentHolder + hdrLen + dataOffset, packet + hdrLen + dataOffset + progress, current_fragment_size);
+                                totalLength = hdrLen + dataOffset + current_fragment_size;
+                                convert_endian(fragmentHolder + 2, &totalLength, 2);
+                                tcpSeq = tcpBaseSeq + progress;
+                                convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
+                                newpacketid(fragmentHolder);
+                                WinDivertHelperCalcChecksums(
+                                    fragmentHolder, totalLength, &addr, 0
+                                );
+                                #ifdef DEBUG
+                                reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeqTrue, packetBACK + hdrLen + dataOffset);
+                                #endif
+                                if (!super_reverse)
+                                WinDivertSend(
+                                    w_filter, fragmentHolder,
+                                    totalLength,
+                                    NULL, &addr
+                                );
+                                else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
+                                progress += current_fragment_size;
+                            }
+                            goto wrapup;
+                        }
+                        if (tls_absolute_frag) { //It now uses the mechanism of TLS Random fragmentation, which is far better. (The old version of TLS absolute fragmentation is GONE. EXTINCT.)
+                            memcpy(fragmentHolder, packet, hdrLen + dataOffset);
+                            progress = 0;
+                            fragging_sni = 0;
+                            while (progress != packetLen - hdrLen - dataOffset) {
+                                try_again_absolute: //goto within a loop! Very scary!
+                                current_fragment_size = !fragging_sni ? tls_absolute_frag : (sni_fragment_size || cleave_sni) ? (cleave_sni ? host_len / 2 : sni_fragment_size) : tls_absolute_frag;
+                                if (!fragging_sni && current_fragment_size == 0) goto try_again_absolute;
+                                if (sni_fragment_size && !fragging_sni && !(packet + hdrLen + dataOffset + progress >= host_addr + host_len) && packet + hdrLen + dataOffset + progress + current_fragment_size >= host_addr) { //Dangerously close to SNI, fragment right before it
+                                    if (!allow_sni_overlap) current_fragment_size = (unsigned int) (host_addr - packet - dataOffset - hdrLen - progress);
+                                    fragging_sni = 1;
+                                    beginSni = fragmentInfoLen + (allow_sni_overlap ? 0 : 1);
+                                    if (!allow_sni_overlap && current_fragment_size == 0) {
+                                        beginSni--;
+                                        goto try_again_absolute;
+                                    }
+                                }
+                                if (sni_fragment_size && fragging_sni && packet + hdrLen + dataOffset + progress + current_fragment_size >= host_addr + host_len) { //Exitting SNI, fragment until the end of the SNI.
+                                    if (!allow_sni_overlap) current_fragment_size = (unsigned int) (host_addr + host_len - packet - hdrLen - dataOffset - progress);
+                                    fragging_sni = 0;
+                                    endSni = fragmentInfoLen;
+                                    if (!allow_sni_overlap && current_fragment_size == 0) goto try_again_absolute;
+                                }
+                                if (hdrLen + dataOffset + progress + current_fragment_size >= packetLen) { //Uh oh.
+                                    current_fragment_size = (unsigned int) (packetLen - hdrLen - dataOffset - progress);
+                                    if (current_fragment_size == 0) goto wrapup;
+                                }
+                                memcpy(fragmentHolder + hdrLen + dataOffset, packet + hdrLen + dataOffset + progress, current_fragment_size);
+                                totalLength = hdrLen + dataOffset + current_fragment_size;
+                                convert_endian(fragmentHolder + 2, &totalLength, 2);
+                                tcpSeq = tcpBaseSeq + progress;
+                                convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
+                                newpacketid(fragmentHolder);
+                                WinDivertHelperCalcChecksums(
+                                    fragmentHolder, totalLength, &addr, 0
+                                );
+                                #ifdef DEBUG
+                                reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeqTrue, packetBACK + hdrLen + dataOffset);
+                                #endif
+                                if (!super_reverse)
+                                WinDivertSend(
+                                    w_filter, fragmentHolder,
+                                    totalLength,
+                                    NULL, &addr
+                                );
+                                else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
+                                progress += current_fragment_size;
+                            }
+                            goto wrapup;
+                        }
+                        /*if (tls_absolute_frag > 0) { 
+                            memcpy(fragmentHolder, packet, hdrLen + dataOffset);
+                            for (int x = (do_reverse_frag && !tls_force_native && !super_reverse) ? ((packetLen - hdrLen - dataOffset) / tls_absolute_frag * tls_absolute_frag) : 0; (x < (packetLen - hdrLen - dataOffset) && (!do_reverse_frag || tls_force_native || super_reverse)) || ((do_reverse_frag && !tls_force_native && !super_reverse) && x >= 0); (do_reverse_frag && !tls_force_native && !super_reverse) ? (x -= tls_absolute_frag) : (x += tls_absolute_frag)) {
                                 totalLength = (x + tls_absolute_frag > (packetLen - hdrLen - dataOffset) ? (packetLen - hdrLen - dataOffset) % tls_absolute_frag : tls_absolute_frag) + hdrLen + dataOffset;
                                 tcpSeq = tcpBaseSeq + x;
                                 convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
@@ -2324,10 +3429,11 @@ int main(int argc, char *argv[]) {
                                         totalLength,
                                         NULL, &addr
                                     );
-                                else add_fragment(fragmentHolder);
+                                else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                             }
                             goto wrapup;
                         }
+                        */
                         if (compound_frag && do_native_frag && !do_reverse_frag && !smart_frag) {
                             send_native_fragment(w_filter, addr, packet, packetLen, packet_data,
                                                 packet_dataLen,packet_v4, packet_v6,
@@ -2364,7 +3470,7 @@ int main(int argc, char *argv[]) {
                                     totalLength,
                                     NULL, &addr
                                 );
-                                else add_fragment(fragmentHolder);
+                                else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                             }
                             analyze_hlen = (packet[0] & 0b00001111) * 4;
                             analyze_dataoffset = ((packet + analyze_hlen)[12] >> 4) * 4;
@@ -2391,7 +3497,7 @@ int main(int argc, char *argv[]) {
                                     totalLength,
                                     NULL, &addr
                                 );
-                            else add_fragment(fragmentHolder);
+                            else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                             //Send the first byte of the cipher suites.
                             fragmentHolder[hdrLen + dataOffset] = packet[hdrLen + dataOffset + 44 + session_len];
                             tcpSeq = tcpBaseSeq + 44 + session_len;
@@ -2411,7 +3517,7 @@ int main(int argc, char *argv[]) {
                                 totalLength,
                                 NULL, &addr
                             );
-                            else add_fragment(fragmentHolder);
+                            else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                             //And now send the rest of it, and put the extensions length as a bonus.
                             for (int i = do_reverse_frag && !tls_force_native && !super_reverse ? ciphersuitelen + 4 : 0; (do_reverse_frag && !tls_force_native && !super_reverse && i >= 0) || (!(do_reverse_frag && !tls_force_native) || super_reverse && i <= ciphersuitelen + 4); (do_reverse_frag && !tls_force_native && !super_reverse) ? (i -= 2) : (i += 2)) {
                                 if (i + 2 <= ciphersuitelen + 4) {
@@ -2438,7 +3544,7 @@ int main(int argc, char *argv[]) {
                                     totalLength,
                                     NULL, &addr
                                 );
-                                else add_fragment(fragmentHolder);
+                                else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                             }
                             //Shift pointers and values
                             tcpBaseSeq += 49 + compresslen + session_len + ciphersuitelen;
@@ -2479,7 +3585,7 @@ int main(int argc, char *argv[]) {
                                             totalLength,
                                             NULL, &addr
                                         );
-                                        else add_fragment(fragmentHolder);
+                                        else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                     }
                                 }
                                 if (host_len % sni_fragment_size > 0 && i == 1) {
@@ -2511,7 +3617,7 @@ int main(int argc, char *argv[]) {
                                         totalLength,
                                         NULL, &addr
                                     );
-                                    else add_fragment(fragmentHolder);
+                                    else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                 }
                             }
                         }
@@ -2543,7 +3649,7 @@ int main(int argc, char *argv[]) {
                                             totalLength,
                                             NULL, &addr
                                         );
-                                        else add_fragment(fragmentHolder);
+                                        else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                     }
                                 }
                                 if (i == 1 && host_len > sni_fragment_size) { //OK
@@ -2568,7 +3674,7 @@ int main(int argc, char *argv[]) {
                                             totalLength,
                                             NULL, &addr
                                         );
-                                        else add_fragment(fragmentHolder);
+                                        else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                     }
                                 }
                                 if (host_len % sni_fragment_size > 0 && i == 1) {
@@ -2591,7 +3697,7 @@ int main(int argc, char *argv[]) {
                                         totalLength,
                                         NULL, &addr
                                     );
-                                    else add_fragment(fragmentHolder);
+                                    else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                 }
                                 if (i == 0) {
                                     //printf("STAGE 1\n");
@@ -2616,7 +3722,7 @@ int main(int argc, char *argv[]) {
                                             totalLength,
                                             NULL, &addr
                                         );
-                                        else add_fragment(fragmentHolder);
+                                        else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                     }
                                 }
                             }
@@ -2646,7 +3752,7 @@ int main(int argc, char *argv[]) {
                                             totalLength,
                                             NULL, &addr
                                         );
-                                        else add_fragment(fragmentHolder);
+                                        else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                     }
                                 }
                                 if (i == 1 && host_len > sni_fragment_size) { //OK
@@ -2671,7 +3777,7 @@ int main(int argc, char *argv[]) {
                                             totalLength,
                                             NULL, &addr
                                         );
-                                        else add_fragment(fragmentHolder);
+                                        else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                     }
                                 }
                                 if (host_len % sni_fragment_size > 0 && i == 1) {
@@ -2694,7 +3800,7 @@ int main(int argc, char *argv[]) {
                                         totalLength,
                                         NULL, &addr
                                     );
-                                    else add_fragment(fragmentHolder);
+                                    else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                 }
                                 if (i == 0) {
                                     //printf("STAGE 1\n");
@@ -2717,7 +3823,7 @@ int main(int argc, char *argv[]) {
                                             totalLength,
                                             NULL, &addr
                                         );
-                                        else add_fragment(fragmentHolder);
+                                        else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                     }
                                 }
                             }
@@ -2749,10 +3855,10 @@ int main(int argc, char *argv[]) {
                                     totalLength,
                                     NULL, &addr
                                 );
-                                else add_fragment(fragmentHolder);
+                                else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                 progress += 1;
                                 //Send the second and third byte.
-                                if (packetLen - dataOffset - hdrLen - progress < 2) { //Ran out of payload data, Exit.
+                                if (packetLen - dataOffset - hdrLen - progress == 1) { //Ran out of payload data, Exit.
                                     fragmentHolder[hdrLen + dataOffset] = packet[hdrLen + dataOffset + progress];
                                     tcpSeq = tcpBaseSeq + progress;
                                     convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
@@ -2771,9 +3877,14 @@ int main(int argc, char *argv[]) {
                                         totalLength,
                                         NULL, &addr
                                     );
-                                    else add_fragment(fragmentHolder);
+                                    else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                     progress += 1;
-                                    continue;
+                                    if (!super_reverse) continue;
+                                    else goto wrapup;
+                                }
+                                else if (packetLen - dataOffset - hdrLen - progress == 0) {
+                                    if (!super_reverse) continue;
+                                    else goto wrapup;
                                 }
                                 memcpy(fragmentHolder + hdrLen + dataOffset, packet + hdrLen + dataOffset + progress, 2);
                                 tcpSeq = tcpBaseSeq + progress;
@@ -2793,10 +3904,16 @@ int main(int argc, char *argv[]) {
                                     totalLength,
                                     NULL, &addr
                                 );
-                                else add_fragment(fragmentHolder);
+                                else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                 progress += 2;
                                 //Send the last byte of extension information.
-                                if (packetLen - dataOffset - hdrLen - progress == 0) continue; //Ran out of payload data, Exit.
+                                if (packetLen - dataOffset - hdrLen - progress == 0) {
+                                    clientHelloSearch[freeWaiting].exttype = extensionType;
+                                    clientHelloSearch[freeWaiting].extlen = packet[dataOffset + hdrLen + progress - 1] << 8;
+                                    clientHelloSearch[freeWaiting].stage = 2;
+                                    if (!super_reverse) continue;
+                                    else goto wrapup;
+                                }
                                 memcpy(fragmentHolder + hdrLen + dataOffset, packet + hdrLen + dataOffset + progress, 1);
                                 tcpSeq = tcpBaseSeq + progress;
                                 convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
@@ -2815,11 +3932,16 @@ int main(int argc, char *argv[]) {
                                     totalLength,
                                     NULL, &addr
                                 );
-                                else add_fragment(fragmentHolder);
+                                else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                 progress += 1;
-                                if (packetLen - dataOffset - hdrLen - progress == 0) continue; //Ran out of payload data, Exit.
+                                if (packetLen - dataOffset - hdrLen - progress == 0) { 
+                                    if (!super_reverse) continue;
+                                    else goto wrapup;
+                                }
                                 //Set the extension's length to the size of the remaining payload if its larger than the remaining payload.
-                                if (extensionLen > packetLen - dataOffset - hdrLen - progress) extensionLen = packetLen - dataOffset - hdrLen - progress;
+                                if (extensionLen > packetLen - dataOffset - hdrLen - progress) {
+                                    extensionLen = packetLen - dataOffset - hdrLen - progress;
+                                }
                                 current_fragment_size = ext_frag_size;
                                 //If the extension is the SNI, use SNI fragment size.
                                 if (extensionType == 0) current_fragment_size = sni_fragment_size;
@@ -2842,7 +3964,7 @@ int main(int argc, char *argv[]) {
                                         totalLength,
                                         NULL, &addr
                                     );
-                                    else add_fragment(fragmentHolder);
+                                    else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                     extensionLen -= current_fragment_size;
                                     progress += current_fragment_size;
                                 }
@@ -2865,7 +3987,7 @@ int main(int argc, char *argv[]) {
                                         totalLength,
                                         NULL, &addr
                                     );
-                                    else add_fragment(fragmentHolder);
+                                    else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                     progress += extensionLen;
                                 }
                             }
@@ -2892,59 +4014,11 @@ int main(int argc, char *argv[]) {
                         wrapup:
                         memcpy(fragmentHolder, packetBACK, hdrLen + dataOffset);
                         if (super_reverse && fragmentInfoLen > 1) {
-                            //printf("Reached Super reverse fragmentation!\n");
-                            if (!vortex_frag) {
-                                for (int i = fragmentInfoLen - 1; i >= 0; i--) {
-                                    tcpSeq = fragmentInfo[i].seq;
-                                    totalLength = hdrLen + dataOffset + fragmentInfo[i].payloadLen;
-                                    convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
-                                    convert_endian(fragmentHolder + 2, &totalLength, 2);
-                                    //printf("SEQS: %u, %u\n", tcpSeq, tcpBaseSeqTrue);
-                                    memcpy(fragmentHolder + hdrLen + dataOffset, packetBACK + hdrLen + dataOffset + (tcpSeq - tcpBaseSeqTrue), totalLength - hdrLen - dataOffset);
-                                    newpacketid(fragmentHolder);
-                                    WinDivertHelperCalcChecksums(
-                                        fragmentHolder, totalLength, &addr, 0
-                                    );
-                                    #ifdef DEBUG
-                                    reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeqTrue, packetBACK + hdrLen + dataOffset);
-                                    #endif
-                                    WinDivertSend(
-                                        w_filter, fragmentHolder,
-                                        totalLength,
-                                        NULL, &addr
-                                    );
-                                }
-                            }
-                            else if (vortex_frag) {
-                                vortex_left = 0;
-                                vortex_right = fragmentInfoLen - 1;
-                                vortex_step = 0;
-                                while (vortex_left != vortex_right) {
-                                    vortex_relevant = (vortex_step % 2 == 0 ? vortex_left : vortex_right);
-                                    //begin frag
-                                    tcpSeq = fragmentInfo[vortex_relevant].seq;
-                                    totalLength = hdrLen + dataOffset + fragmentInfo[vortex_relevant].payloadLen;
-                                    convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
-                                    convert_endian(fragmentHolder + 2, &totalLength, 2);
-                                    memcpy(fragmentHolder + hdrLen + dataOffset, packetBACK + hdrLen + dataOffset + (tcpSeq - tcpBaseSeqTrue), totalLength - hdrLen - dataOffset);
-                                    newpacketid(fragmentHolder);
-                                    WinDivertHelperCalcChecksums(
-                                        fragmentHolder, totalLength, &addr, 0
-                                    );
-                                    #ifdef DEBUG
-                                    reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeqTrue, packetBACK + hdrLen + dataOffset);
-                                    #endif
-                                    WinDivertSend(
-                                        w_filter, fragmentHolder,
-                                        totalLength,
-                                        NULL, &addr
-                                    );
-                                    //ending sequence
-                                    if (vortex_left == vortex_relevant) vortex_left++;
-                                    else vortex_right--;
-                                    vortex_step++;
-                                }
-                            }
+                            unsigned char mode = 0;
+                            if (record_frag) mode = 3;
+                            else if (vortex_frag) mode = 1;
+                            else if (rplrr) mode = 2;
+                            do_super_reverse_frag(mode, fragmentInfo, fragmentInfoLen, packetBACK, tcpBaseSeqTrue);
                         }
                         #ifdef DEBUG
                         if (!smart_frag && compound_frag) packetLen += https_fragment_size;
@@ -3075,9 +4149,8 @@ int main(int argc, char *argv[]) {
                 }
             }
             if (should_reinject) {
-                //printf("Re-injecting!\n");
                 if (should_recalc_checksum) {
-                    newpacketid(fragmentHolder);
+                    newpacketid(packet);
                     WinDivertHelperCalcChecksums(packet, packetLen, &addr, (UINT64)0LL);
                 }
                 WinDivertSend(w_filter, packet, packetLen, NULL, &addr);
@@ -3086,7 +4159,7 @@ int main(int argc, char *argv[]) {
         else {
             // error, ignore
             if (!exiting)
-                printf("Error receiving packet!\n");
+                printf("Error receiving packet! (%u)\n", GetLastError());
             break;
         }
     }
