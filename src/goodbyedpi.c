@@ -21,11 +21,11 @@
 #include "blackwhitelist.h" 
 #include "fakepackets.h"
 #include <pthread.h>    
-#include <windows.h>    
+#include <windows.h>
 #define MAX_PACKET_SIZE 2048
 #define SHOWSNI
 #define FATASSMAXLIFE 256
-#define OBSERVATION
+#define DOLOCALNETS
 // My mingw installation does not load inet_pton definition for some reason
 WINSOCK_API_LINKAGE INT WSAAPI inet_pton(INT Family, LPCSTR pStringBuf, PVOID pAddr);
 
@@ -250,8 +250,9 @@ static struct option long_options[] = {
     {"tls-recseg-size",required_argument,0,'C' },
     {"cleave-sni",  no_argument,       0,  'N' },
     {"host-shiftback",required_argument,0, 'K' },
-    {"fragnt",      no_argument,       0,  'I' },
     {"reverse-fix", no_argument,       0,  'Q' },
+    {"fnroor",      no_argument,       0,  'W' },
+    {"illegal-segments",required_argument,0,'B'},
     {0,             0,                 0,   0  }
 };
 
@@ -463,7 +464,7 @@ HANDLE thrash_filter;
 HANDLE conntrack_filter;
 HANDLE synner_filter;
 static void sigint_handler(int sig __attribute__((unused))) {
-    printf("Attempting shutdown...\n");
+    //printf("Attempting shutdown...\n");
     exiting = 1;
     deinit_all();
     if (activate_thrash) {
@@ -486,6 +487,14 @@ static void sigsegv_handler(int sig __attribute__((unused))) {
     if (activate_thrash) {
 	    WinDivertShutdown(thrash_filter, WINDIVERT_SHUTDOWN_BOTH);
 	    WinDivertClose(thrash_filter);
+    }
+    if (doing_conntrack) {
+	    WinDivertShutdown(conntrack_filter, WINDIVERT_SHUTDOWN_BOTH);
+	    WinDivertClose(conntrack_filter);
+    }
+    if (synning) {
+	    WinDivertShutdown(synner_filter, WINDIVERT_SHUTDOWN_BOTH);
+	    WinDivertClose(synner_filter);
     }
     printf("Segmentation Fault\n");
     #ifndef DEBUG
@@ -1075,6 +1084,7 @@ struct connection {
     unsigned int ip;
     unsigned int seq;
     unsigned short mss;
+    unsigned short life;
     unsigned char taken;
 };
 int parse_clienthello(unsigned char* packet, struct clienthello* clienthello) {
@@ -1089,7 +1099,6 @@ int parse_clienthello(unsigned char* packet, struct clienthello* clienthello) {
     clienthello->length = ntohl(*((unsigned int*)(packet + hdrLen + dataOffset + progress)) & 0xFFFFFF00);
     progress += 4;
     clienthello->version = ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + progress)));
-    printf("PREVER: %u\n", ntohs(*((unsigned short*)(packet + hdrLen + dataOffset + progress))));
     progress += 2;
     memcpy(clienthello->random, packet + hdrLen + dataOffset + progress, 32);
     progress += 32;
@@ -1140,7 +1149,7 @@ unsigned short rebuild_clienthello(struct clienthello* clienthello, unsigned cha
     *((unsigned int*)(destPacketPayload)) = 0x00010316;
     unsigned short progress = 9;
     *((unsigned short*)(destPacketPayload + progress)) = htons(clienthello->version);
-    printf("VER: %u\n", clienthello->version);
+    //printf("VER: %u\n", clienthello->version);
     progress += 2;
     memcpy(destPacketPayload + progress, clienthello->random, 32);
     progress += 32;
@@ -1166,7 +1175,7 @@ unsigned short rebuild_clienthello(struct clienthello* clienthello, unsigned cha
     unsigned short progressbackup = progress;
     progress += 2;
     for (unsigned short i = 0; i < clienthello->extensionCount; i++) {
-        printf("Constructing extension %u with length %u\n", clienthello->extensions[i].type, clienthello->extensions[i].length);
+        //printf("Constructing extension %u with length %u\n", clienthello->extensions[i].type, clienthello->extensions[i].length);
         *((unsigned short*)(destPacketPayload + progress)) = htons(clienthello->extensions[i].type);
         progress += 2;
         *((unsigned short*)(destPacketPayload + progress)) = htons(clienthello->extensions[i].length);
@@ -1180,7 +1189,7 @@ unsigned short rebuild_clienthello(struct clienthello* clienthello, unsigned cha
     *((unsigned int*)(destPacketPayload + 5)) = htonl(length - 4) | 0x00000001;
     progress = progressbackup;
     *((unsigned short*)(destPacketPayload + progress)) = htons(extensionsLen);
-    printf("Record length: %u\n", length);
+    //printf("Record length: %u\n", length);
     return length + 5;
 }
 void delete_clienthello(struct clienthello* clienthello) { //Memory management!!!!!
@@ -1409,24 +1418,23 @@ struct clientHelloSearchChunk {
     unsigned short stage; //stage 0: sent first byte of ext type, stage 1: interrupted by incomplete payload, sent second byte of ext type, stage 2: sent second byte of ext type and first byte of ext len, stage 3: sent second byte of ext len, proceed with fragmenting along ext len, stage 4: perfectly fragmented, initiate as usual
 };
 struct conntracksig { //Rudimentary conntrack. This also means that if you shut down goodbyeDPI, all goes to shit and everything needs to reconnect.
-    unsigned char busy;
-    unsigned int ip;
+    WINDIVERT_ADDRESS addr;
     int offset;
+    unsigned int ip;
     unsigned int upperseq; //SEQ upper bound
     unsigned int lowerseq; //SEQ lower bound
     unsigned int originseq;
-    unsigned char overload[5]; //Storage for reassembling overloaded TLS record headers.
-    unsigned short tlsver; //TLS Version. Pulled from application data packets. [Very useless.]
-    unsigned char overloadlen;
-    unsigned int nextrecord;
+    unsigned int inboundseq;
+    unsigned short clientport;
     unsigned short nextpacketid;
-    unsigned char ccssent;
+    unsigned short mss;
+    unsigned short illegalsegmentlen;
+    unsigned char busy;
     unsigned char retransmits;
-    unsigned char outfin; //MAYBE killing the connection as soon as ONE FIN leaves from OUR COMPUTER isn't a great idea.
+    unsigned char outfin;
     unsigned char infin;
-    unsigned char lastack;
+    unsigned char illegalsegment[MAX_PACKET_SIZE * 2];
     char associatedsni[256];
-    WINDIVERT_ADDRESS addr;
 };
 struct fatasssig {
     unsigned short life;
@@ -1462,6 +1470,9 @@ int main(int argc, char *argv[]) {
     fragmentHolder = calloc(MAX_PACKET_SIZE, sizeof(char));
     reassemblePacket = calloc(MAX_PACKET_SIZE, sizeof(char));
     fatass = calloc(512, sizeof(struct fatasssig));
+    unsigned char* illegalSegment = calloc(MAX_PACKET_SIZE * 2, sizeof(unsigned char));
+    unsigned short illegalSegmentLen = 0;
+    unsigned char fakehost[HOST_MAXLEN];
     unsigned char* reassembleSegments = calloc(4216, sizeof(unsigned char));
     unsigned char* packetBACK = calloc(MAX_PACKET_SIZE * 8, sizeof(unsigned char));
     fragmentInfo = calloc(MAX_PACKET_SIZE - 40, sizeof(struct fragmentInfoChunk));
@@ -1516,7 +1527,7 @@ int main(int argc, char *argv[]) {
         tls_rando_frag = 0,
         fragging_sni = 0,
         tls_len = 0,
-        no_ccs = 0,
+        illegal_segments = 0,
         wacky_frag = 0, do_native_frag = 0, do_reverse_frag = 0, record_frag = 0, super_reverse = 0, rplrr = 0, rplrr_by_sni, reusable = 0, mss = 0, smart_frag = 0, compound_frag = 0, tls_force_native = 0, /*udp_fragments = 0, */proceed = 0, totalHdrLength = 0, acted = 0,
         vortex_frag = 0, vortex_frag_by_sni = 0, vortex_step = 0, vortex_left = 0, vortex_direction = 0, vortex_right = 0, vortex_step_left = 1, vortex_step_right = 1, vortex_relevant = 0, freeWaiting = 0; //"Big boy words" my ass, it's literally vortex shaped.
     unsigned int http_fragment_size = 0, https_fragment_size = 0, tls_segment_size = 0, sni_fragment_size = 0, ext_frag_size = 0, tls_absolute_frag = 0, tls_recseg_size = 0, current_fragment_size = 0, udp_fakes = 0, progress = 0, addoffset = 0, alter_max_record_len = 0;
@@ -1533,7 +1544,7 @@ int main(int argc, char *argv[]) {
     struct in6_addr dns_temp_addr = {0};
     uint16_t dnsv4_port = htons(53);
     uint16_t dnsv6_port = htons(53);
-    unsigned char *host_addr, *useragent_addr, *method_addr, fragnt = 0, reverse_fix = 0;
+    unsigned char *host_addr, *useragent_addr, *method_addr, reverse_fix = 0, fnroor = 0;
     unsigned int host_len, useragent_len, faketotallength = 0, tcpBaseSeq = 0, tcpBaseSeqTrue = 0;
     int http_req_fragmented;
     uint16_t fragmentLength = 0;
@@ -1570,7 +1581,7 @@ int main(int argc, char *argv[]) {
             checked[i] = 0;
         }
         switch (mode) {
-            case 1:
+            case 1: // --vortex-frag
                 vortex_left = vortex_frag_by_sni ? beginSni : 0;
                 vortex_right = fragmentInfoLen - 1;
                 vortex_step = 0;
@@ -1603,7 +1614,7 @@ int main(int argc, char *argv[]) {
                     WinDivertHelperCalcChecksums(
                         fragmentHolder, totalLength, &addr, 0
                     );
-                    reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, srcPacket + hdrLen + dataOffset);
+                    //reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, srcPacket + hdrLen + dataOffset);
                     WinDivertSend(
                         w_filter, fragmentHolder,
                         totalLength,
@@ -1625,7 +1636,7 @@ int main(int argc, char *argv[]) {
                         WinDivertHelperCalcChecksums(
                             fragmentHolder, totalLength, &addr, 0
                         );
-                        reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, srcPacket + hdrLen + dataOffset);
+                        //reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, srcPacket + hdrLen + dataOffset);
                         //differentiate(fragmentHolder + hdrLen + dataOffset, totalLength - dataOffset - hdrLen, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset, 1);
                         WinDivertSend(
                             w_filter, fragmentHolder,
@@ -1635,7 +1646,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 break;
-            case 2:
+            case 2: // --rplrr
                 //printf("Begin RPLRR\n");
                 for (int i = 0; i < 2048; i++) {
                     reassembleSegments[i] = 255;
@@ -1656,7 +1667,7 @@ int main(int argc, char *argv[]) {
                     WinDivertHelperCalcChecksums(
                         fragmentHolder, totalLength, &addr, 0
                     );
-                    reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, srcPacket + hdrLen + dataOffset);
+                    //reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, srcPacket + hdrLen + dataOffset);
                     //differentiate(fragmentHolder + hdrLen + dataOffset, totalLength - dataOffset - hdrLen, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset, 1);
                     WinDivertSend(
                         w_filter, fragmentHolder,
@@ -1697,7 +1708,7 @@ int main(int argc, char *argv[]) {
                         WinDivertHelperCalcChecksums(
                             fragmentHolder, totalLength, &addr, 0
                         );
-                        reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, srcPacket + hdrLen + dataOffset);
+                        //reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeq, srcPacket + hdrLen + dataOffset);
                         //differentiate(fragmentHolder + hdrLen + dataOffset, totalLength - dataOffset - hdrLen, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset, 1);
                         WinDivertSend(
                             w_filter, fragmentHolder,
@@ -1707,7 +1718,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 break;
-            case 3: //It's a shitty shittus. [It works, don't check this.]
+            case 3: // --record-frag
                 //Before this thing causes everything to go to shit, check if theres already a conntrack entry for this connection.
                 for (int i = 0; i < conntrack_curlen; i++) {
                     if (conntrack[i].originseq == tcpBaseSeq) {
@@ -1733,28 +1744,26 @@ int main(int argc, char *argv[]) {
                     freeWaiting = conntrack_curlen++;
                 }
                 //printf("Expecting SEQ %u\n", tcpBaseSeq + (packetLen + 5 - hdrLen - dataOffset) + (fragmentInfoLen - 1) * 5);
-                if (!fragnt) {
-                    conntrack[freeWaiting].busy = 1;
-                    conntrack[freeWaiting].ip = *((unsigned int*)(packet + 16));
-                    conntrack[freeWaiting].lowerseq = tcpBaseSeq + (packetLen + 5 - hdrLen - dataOffset) - (alter_max_record_len > 0 ? 6 : 0);
-                    conntrack[freeWaiting].upperseq = tcpBaseSeq + (packetLen + 5 - hdrLen - dataOffset) - (alter_max_record_len > 0 ? 6 : 0);
-                    conntrack[freeWaiting].offset = (fragmentInfoLen - 1) * 5 + addoffset;
-                    conntrack[freeWaiting].originseq = tcpBaseSeq;
-                    for (int i = 0; i < host_len; i++) {
-                        conntrack[freeWaiting].associatedsni[i] = host_addr[i];
-                    }
-                    conntrack[freeWaiting].associatedsni[host_len] = 0;
-                    conntrack[freeWaiting].nextrecord = 0;
-                    conntrack[freeWaiting].nextpacketid = ntohs(*((unsigned short*)(srcPacket + 4)));
-                    conntrack[freeWaiting].outfin = 0; 
-                    conntrack[freeWaiting].infin = 0;
-                    conntrack[freeWaiting].ccssent = 0;
-                    conntrack[freeWaiting].busy = 0;
-                    //printf("Packets beginning from SEQ %u will now have their SEQ shifted by %u bytes.\n", conntrack[freeWaiting].lowerseq, conntrack[freeWaiting].offset);
-                    #ifdef TLSDEBUG
-                    printf("Expecting an inbound ACK of %u, Relative ACK: %u\n", conntrack[freeWaiting].upperseq + conntrack[freeWaiting].offset, conntrack[freeWaiting].upperseq + conntrack[freeWaiting].offset - conntrack[freeWaiting].originseq);
-                    #endif
+                conntrack[freeWaiting].busy = 1;
+                conntrack[freeWaiting].ip = *((unsigned int*)(packet + 16));
+                conntrack[freeWaiting].lowerseq = tcpBaseSeq + (packetLen + 5 - hdrLen - dataOffset) - (alter_max_record_len > 0 ? 6 : 0);
+                conntrack[freeWaiting].upperseq = tcpBaseSeq + (packetLen + 5 - hdrLen - dataOffset) - (alter_max_record_len > 0 ? 6 : 0);
+                conntrack[freeWaiting].offset = (fragmentInfoLen - 1) * 5 + addoffset;
+                conntrack[freeWaiting].originseq = tcpBaseSeq;
+                conntrack[freeWaiting].illegalsegmentlen = 0;
+                conntrack[freeWaiting].mss = 1200;
+                for (int i = 0; i < host_len; i++) {
+                    conntrack[freeWaiting].associatedsni[i] = host_addr[i];
                 }
+                conntrack[freeWaiting].associatedsni[host_len] = 0;
+                conntrack[freeWaiting].nextpacketid = ntohs(*((unsigned short*)(srcPacket + 4)));
+                conntrack[freeWaiting].outfin = 0; 
+                conntrack[freeWaiting].infin = 0;
+                conntrack[freeWaiting].busy = 0;
+                //printf("Packets beginning from SEQ %u will now have their SEQ shifted by %u bytes.\n", conntrack[freeWaiting].lowerseq, conntrack[freeWaiting].offset);
+                #ifdef TLSDEBUG
+                printf("Expecting an inbound ACK of %u, Relative ACK: %u\n", conntrack[freeWaiting].upperseq + conntrack[freeWaiting].offset, conntrack[freeWaiting].upperseq + conntrack[freeWaiting].offset - conntrack[freeWaiting].originseq);
+                #endif
                 tls_reassembly_progress = 0;
                 progress = 0;
                 unsigned short begin_sni;
@@ -1787,14 +1796,9 @@ int main(int argc, char *argv[]) {
                         current_fragment_size = midpoint - progress;
                     }
                     if (progress + current_fragment_size >= tls_len) { //Uh oh.
-                        current_fragment_size = (unsigned int) (tls_len - progress);
+                        current_fragment_size = tls_len - progress;
                         if (current_fragment_size == 0) break;
                     }
-                    if (fragnt && progress + current_fragment_size >= packetBACKLen - hdrLen - dataOffset) { //SIKE!
-                        printf("fragnt\n");
-                        break;
-                    }
-                    else if (fragnt) printf("frag\n");
                     memcpy(fragmentHolder + hdrLen + dataOffset, recordbuffer + progress, current_fragment_size);
                     totalLength = hdrLen + dataOffset + current_fragment_size;
                     convert_endian(fragmentHolder + 2, &totalLength, 2);
@@ -1818,62 +1822,13 @@ int main(int argc, char *argv[]) {
                 }
                 memmove(recordbuffer + hdrLen + dataOffset, recordbuffer, tls_len);
                 memcpy(recordbuffer, packetBACK, hdrLen + dataOffset);
-                unsigned char mode = 0;
+                mode = 0;
                 if (vortex_frag) mode = 1;
                 else if (rplrr) mode = 2;
-                printf("Sending %u fragments.\n", fragmentInfoLen);
+                else if (illegal_segments && illegalSegmentLen > 0) mode = 4;
+                //printf("Sending %u fragments.\n", fragmentInfoLen);
                 if (!tls_force_native)
                 do_super_reverse_frag(mode, fragmentInfo, fragmentInfoLen, recordbuffer, tcpBaseSeqTrue);
-                if (fragnt) {
-                    short mss = 1200;
-                    for (int i = 0; i < connectionslen; i++) {
-                        if (connections[i].taken && connections[i].ip == *((unsigned int*)(srcPacket + 16)) && connections[i].seq == ntohl(*((unsigned int*)(srcPacket + hdrLen + 4)))) {
-                            mss = connections[i].mss;
-                            connections[i].taken = 0;
-                            break;
-                        }
-                    }
-                    if (mss == 1200) printf("ERROR: CONNECTION TRACKING FAIL\n");
-                    if (packetLen > mss) {
-                        memcpy(fragmentHolder, srcPacket, hdrLen + dataOffset);
-                        progress = 0;
-                        while (progress != packetBACKLen - hdrLen - dataOffset) {
-                            current_fragment_size = mss;
-                            if (hdrLen + dataOffset + progress + current_fragment_size >= packetBACKLen) { //Uh oh.
-                                current_fragment_size = (unsigned int) (packetBACKLen - hdrLen - dataOffset - progress);
-                                if (current_fragment_size == 0) break;
-                            }
-                            memcpy(fragmentHolder + hdrLen + dataOffset, srcPacket + hdrLen + dataOffset + progress, current_fragment_size);
-                            totalLength = hdrLen + dataOffset + current_fragment_size;
-                            convert_endian(fragmentHolder + 2, &totalLength, 2);
-                            tcpSeq = tcpBaseSeq + progress;
-                            convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
-                            newpacketid(fragmentHolder);
-                            WinDivertHelperCalcChecksums(
-                                fragmentHolder, totalLength, &addr, 0
-                            );
-                            #ifdef DEBUG
-                            reassemble_and_compare(fragmentHolder, reassembleSegments, tcpBaseSeqTrue, srcPacket + hdrLen + dataOffset);
-                            #endif
-                            WinDivertSend(
-                                w_filter, fragmentHolder,
-                                totalLength,
-                                NULL, &addr
-                            );
-                            progress += current_fragment_size;
-                        }
-                    }
-                    else {
-                        WinDivertHelperCalcChecksums(
-                            srcPacket, packetBACKLen, &addr, 0
-                        );
-                        WinDivertSend(
-                            w_filter, srcPacket,
-                            packetBACKLen,
-                            NULL, &addr
-                        );
-                    }
-                }
                 #ifdef TLSPRINT
                 xprint(srcPacket + hdrLen + dataOffset + 5, packetLen - dataOffset - hdrLen, 40);
                 printf("\n\n");
@@ -1883,8 +1838,46 @@ int main(int argc, char *argv[]) {
                 if (tls_reassembly_progress != packetLen - dataOffset - hdrLen) printf("ERROR: MESSAGE LENGTH MISMATCH\n");
                 #endif
                 break;
-            case 4: // --first-native
-                
+            case 4: // Internal fragmentation mode for record fragmentation.
+                unsigned short mss = 1200;
+                for (int i = 0; i < connectionslen; i++) {
+                    if (connections[i].taken && connections[i].ip == *((unsigned int*)(srcPacket + 16)) && connections[i].seq == ntohl(*((unsigned int*)(srcPacket + hdrLen + 4)))) {
+                        mss = connections[i].mss;
+                        connections[i].taken = 0;
+                        break;
+                    }
+                }
+                if (mss == 1200) printf("ERROR: CONNECTION TRACKING FAIL\n");
+                tcpBaseSeq -= illegalSegmentLen - hdrLen - dataOffset;
+                for (int i = 0; i < fragmentInfoLen; i++) {
+                    totalLength = illegalSegmentLen + fragmentInfo[i].payloadLen;
+                    memcpy(illegalSegment + illegalSegmentLen, srcPacket + hdrLen + dataOffset + (fragmentInfo[i].seq - tcpBaseSeqTrue), fragmentInfo[i].payloadLen);
+                    progress = 0;
+                    static unsigned short auxTotalLength = 0;
+                    while (progress != totalLength - hdrLen - dataOffset) {
+                        current_fragment_size = mss;
+                        if (hdrLen + dataOffset + progress + current_fragment_size >= totalLength) { //Uh oh.
+                            current_fragment_size = (unsigned int) (illegalSegmentLen - hdrLen - dataOffset - progress);
+                            if (current_fragment_size == 0) break;
+                        }
+                        memcpy(fragmentHolder + hdrLen + dataOffset, illegalSegment + hdrLen + dataOffset + progress, current_fragment_size);
+                        auxTotalLength = hdrLen + dataOffset + current_fragment_size;
+                        convert_endian(fragmentHolder + 2, &auxTotalLength, 2);
+                        tcpSeq = tcpBaseSeq + progress;
+                        convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
+                        newpacketid(fragmentHolder);
+                        WinDivertHelperCalcChecksums(
+                            fragmentHolder, auxTotalLength, &addr, 0
+                        );
+                        WinDivertSend(
+                            w_filter, fragmentHolder,
+                            auxTotalLength,
+                            NULL, &addr
+                        );
+                        progress += current_fragment_size;
+                    }
+                }
+                break;
             default:
                 memcpy(fragmentHolder, srcPacket, hdrLen + dataOffset);
                 for (int i = fragmentInfoLen - 1; i >= 0; i--) {
@@ -1906,6 +1899,7 @@ int main(int argc, char *argv[]) {
                 }
                 break;
         }
+        //printf("Finish reverse\n");
     }
     void* thrash() { //Why do I need a void* function instead of a void? Oh well.
         thrash_filter = WinDivertOpen("outbound and udp and !impostor and !loopback and udp.DstPort > 49999 and udp.DstPort < 50100\0", WINDIVERT_LAYER_NETWORK, 1, 0);
@@ -1942,8 +1936,8 @@ int main(int argc, char *argv[]) {
     char synner_filter_str_default[] = "!impostor && !loopback && tcp.Syn && ((outbound && tcp.DstPort == 443) || (inbound && tcp.Ack && tcp.SrcPort == 443))\0";
     char synner_filter_str_discord_vc[] = "!impostor && !loopback && tcp.Syn && ((outbound && (tcp.DstPort == 443 || (tcp.DstPort > 1999 && tcp.DstPort < 2100))) || (inbound && tcp.Ack && (tcp.SrcPort == 443 || (tcp.SrcPort > 1999 && tcp.SrcPort < 2100))))\0";
     #else
-    char synner_filter_str_default[] = "!impostor && outbound && tcp.Syn && tcp.DstPort == 443\0";
-    char synner_filter_str_discord_vc[] = "!impostor && outbound && tcp.Syn && (tcp.DstPort == 443 || (tcp.DstPort > 1999 and tcp.DstPort < 2100))\0";
+    char synner_filter_str_default[] = "!impostor && tcp.Syn && ((outbound && tcp.DstPort == 443) || (inbound && tcp.Ack && tcp.SrcPort == 443))\0";
+    char synner_filter_str_discord_vc[] = "!impostor && tcp.Syn && ((outbound && (tcp.DstPort == 443 || (tcp.DstPort > 1999 && tcp.DstPort < 2100))) || (inbound && tcp.Ack && (tcp.SrcPort == 443 || (tcp.SrcPort > 1999 && tcp.SrcPort < 2100))))\0";
     #endif
     char* synner_filter_str = synner_filter_str_default;
     short connfreewaiting;
@@ -1957,36 +1951,42 @@ int main(int argc, char *argv[]) {
                 connfreewaiting = -1;
                 if (!synner_addr.Outbound) {
                     for (int i = 0; i < connectionslen; i++) {
-                        if (!connections[i].taken) {
-                            freeWaiting = i;
-                            break;
+                        if (!connections[i].taken && connfreewaiting == -1) {
+                            connfreewaiting = i;
+                        }
+                        else if (connections[i].taken) {
+                            connections[i].life += 1;
+                            if (connections[i].life > 256) connections[i].taken = 0;
                         }
                     }
                     if (connfreewaiting == -1 && connectionslen == 512) {
                         printf("CRAP CRAP CRAP CRAP\n");
                     }
-                    if (connfreewaiting == -1) {
+                    else if (connfreewaiting == -1) {
                         connfreewaiting = connectionslen++;
                     }
-                    if (!synner_addr.Outbound) {
+                    if (connfreewaiting != -1) {
                         connections[connfreewaiting].ip = *((unsigned int*)(synner_packet + 12));
-                        connections[connfreewaiting].seq = ntohl(*((unsigned int*)(synner_packet + synnerhdrLen + 8))) - 1; //Gotta hate the 1 added to the SYN/ACK.
+                        connections[connfreewaiting].seq = ntohl(*((unsigned int*)(synner_packet + synnerhdrLen + 8)));
                     }
                 }
-                if (mss > 0) {
-                    findmss = 0;
-                    //Locate the MSS option.
-                    for (int i = synnerhdrLen; i < synnerdataOffset; i += synner_packet[synnerhdrLen + i] > 1 ? synner_packet[synnerhdrLen + i + 1] : 1) { //Actually cramming logic in there. Amazing.
-                        if (synner_packet[synnerhdrLen + i] == 2) {
-                            findmss = i + 2;
-                            break;
-                        }
+                findmss = 0;
+                //Locate the MSS option.
+                for (int i = synnerhdrLen; i < synnerdataOffset; i += synner_packet[synnerhdrLen + i] > 1 ? synner_packet[synnerhdrLen + i + 1] : 1) { //Actually cramming logic in there. Amazing.
+                    if (synner_packet[synnerhdrLen + i] == 2) {
+                        findmss = i + 2;
+                        break;
                     }
-                    if (findmss != 0) {
+                }
+                if (findmss != 0) {
+                    if (mss > 0) {
                         if (ntohs(*((unsigned short*)(synner_packet + synnerhdrLen + findmss))) > mss && synner_addr.Outbound) { //Now not stupid!
                             *((unsigned short*)(synner_packet + synnerhdrLen + findmss)) = htons(mss);
                         }
-                        if (!synner_addr.Outbound) connections[connfreewaiting].mss = ntohs(*((unsigned short*)(synner_packet + synnerhdrLen + findmss)));
+                    }
+                    if (!synner_addr.Outbound) {
+                        connections[connfreewaiting].mss = ntohs(*((unsigned short*)(synner_packet + synnerhdrLen + findmss)));
+                        printf("Associating connection with SEQ %u with IP %u.%u.%u.%u to MSS %u\n", connections[connfreewaiting].seq, ((unsigned char*)&(connections[connfreewaiting].ip))[0], ((unsigned char*)&(connections[connfreewaiting].ip))[1], ((unsigned char*)&(connections[connfreewaiting].ip))[2], ((unsigned char*)&(connections[connfreewaiting].ip))[3], connections[connfreewaiting].mss);
                     }
                 }
                 if (disable_sack && synner_addr.Outbound) { //Remove SACK_PERM.
@@ -2006,175 +2006,113 @@ int main(int argc, char *argv[]) {
                 break;
             }
         }
+        else printf("synner init error %u\n", GetLastError());
     }
-    unsigned char conntrack_packet[65536];
-    unsigned char conntrack_fragholder[65536];
+    unsigned char conntrack_packet[65536], conntrack_fragholder[65536];
     UINT conntrack_packetLen;
     WINDIVERT_ADDRESS conntrack_addr;
-    unsigned int conntracktotalLength = 0, conntrack_progress = 0;
+    unsigned short conntrack_progress = 0;
     //'tis hardcoded.
     unsigned char conntrack_should_reinject = 0, conntrackhdrLen = 0, conntrackdataOffset = 0;
     #ifndef DOLOCALNETS
-    char conntrack_filter_str_default[] = "!tcp.Syn && !impostor and !loopback and ((inbound and tcp.SrcPort == 443 and tcp.Ack) or (outbound and tcp.DstPort == 443))\0";
-    char conntrack_filter_str_discord_vc[] = "!tcp.Syn && !impostor and !loopback and ((inbound and tcp.SrcPort == 443) or (outbound and tcp.DstPort == 443) or (outbound and tcp.DstPort > 1999 and tcp.DstPort < 2100))\0";
+    char conntrack_filter_str_default[] = "!tcp.Syn && !impostor and !loopback and ((inbound and tcp.SrcPort == 443 and tcp.Ack) or (outbound and tcp.DstPort == 443))\0",
+         conntrack_filter_str_discord_vc[] = "!tcp.Syn && !impostor and !loopback and ((inbound and tcp.SrcPort == 443) or (outbound and tcp.DstPort == 443) or (outbound and tcp.DstPort > 1999 and tcp.DstPort < 2100))\0";
     #else
-    char conntrack_filter_str_default[] = "!tcp.Syn && !impostor and (((inbound or loopback) and tcp.SrcPort == 443 and tcp.Ack) or (outbound and tcp.DstPort == 443))\0";
-    char conntrack_filter_str_discord_vc[] = "!tcp.Syn && !impostor and (((inbound or loopback) and tcp.SrcPort == 443) or (outbound and tcp.DstPort == 443) or (outbound and tcp.DstPort > 1999 and tcp.DstPort < 2100))\0";
+    char conntrack_filter_str_default[] = "!tcp.Syn && !impostor and (((inbound or loopback) and tcp.SrcPort == 443 and tcp.Ack) or (outbound and tcp.DstPort == 443))\0",
+         conntrack_filter_str_discord_vc[] = "!tcp.Syn && !impostor and (((inbound or loopback) and tcp.SrcPort == 443) or (outbound and tcp.DstPort == 443) or (outbound and tcp.DstPort > 1999 and tcp.DstPort < 2100))\0";
     #endif
-    char* conntrack_filter_str = conntrack_filter_str_default;
+    char *conntrack_filter_str = conntrack_filter_str_default, final_ack = 0, conntrack_outbound = 0;
     unsigned int ctrack_tcpSeq = 0;
-    void* do_conntrack() { //The backbone of advanced GoodbyeDPI functionality.
+    void* do_conntrack() { //The backbone of advanced GoodbyeDPI functionality. It's also crazy slow. But neater now.
         conntrack_filter = WinDivertOpen(conntrack_filter_str, WINDIVERT_LAYER_NETWORK, 2, 0);
         if (conntrack_filter != INVALID_HANDLE_VALUE)
         while (!exiting) {
-            //printf("do loop\n");
             if (WinDivertRecv(conntrack_filter, conntrack_packet, 65536, &conntrack_packetLen, &conntrack_addr)) {
+                final_ack = 0;
                 conntrack_should_reinject = 1;
-                //printf("recv\n");
                 conntrackhdrLen = (conntrack_packet[0] & 0xF) * 4;
                 conntrackdataOffset = (conntrack_packet[conntrackhdrLen + 12] >> 4) * 4;
                 convert_endian(&conntrack_packetLen, conntrack_packet + 2, 2);
-                //Do conntrack stuff
-                conntrack_ip = *((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) ? (unsigned int*)(conntrack_packet + 16) : (unsigned int*)(conntrack_packet + 12));
-                conntrack_seq = (conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) ? ntohl(*((unsigned int*)(conntrack_packet + conntrackhdrLen + 4))) : ntohl(*((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)));
-                #ifdef TLSDEBUG
-                if (conntrack_ip & 0x0011117F == 0x7F) printf("localhost traffic captured...\n");
-                #endif
-                //printf("Begin\n");
+                conntrack_outbound = conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443;
+                conntrack_ip = *(conntrack_outbound ? (unsigned int*)(conntrack_packet + 16) : (unsigned int*)(conntrack_packet + 12));
+                conntrack_seq = conntrack_outbound ? ntohl(*((unsigned int*)(conntrack_packet + conntrackhdrLen + 4))) : ntohl(*((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)));
                 for (int i = 0; i < conntrack_curlen; i++) {
-                    //printf("i'm doing conntrack x%d\n", i);
-                    if (!conntrack[i].busy && conntrack[i].ip == conntrack_ip && (((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) ? conntrack_seq : conntrack_seq - conntrack[i].offset) >= conntrack[i].lowerseq && ((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) ? conntrack_seq : conntrack_seq - conntrack[i].offset) <= conntrack[i].upperseq)) {
-                        #ifdef TLSDEBUG
-                        printf("match!!!!\n");
-                        #endif
-                        if ((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) && (*(conntrack_packet + conntrackhdrLen + 13) & 0b00000001)) {
-                            conntrack[i].outfin = 1;
-                            conntrack[i].upperseq += 1;
-                        }
-                        else if ((*(conntrack_packet + conntrackhdrLen + 13) & 0b00000001)) {
-                            conntrack[i].infin = 1;
-                        }
-                        if (conntrack[i].infin && conntrack[i].outfin && (*(conntrack_packet + conntrackhdrLen + 13) & 0b00010000) > 0) {
-                            conntrack[i].lastack = 1;
-                            *((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)) = htonl(conntrack_seq - conntrack[i].offset);
-                        }
-                        if ((conntrack[i].lastack) || ((*(conntrack_packet + conntrackhdrLen + 13) & 0b00000100) > 0)) { //Annihilate the conntrack connection if this packet fully terminates the connection.
-                            conntrack[i].busy = 0; conntrack[i].ip = 0; conntrack[i].lowerseq = 0; 
-                            conntrack[i].upperseq = 0; conntrack[i].offset = 0; conntrack[i].originseq = 0; 
-                            conntrack[i].nextrecord = 0; conntrack[i].overloadlen = 0; conntrack[i].nextpacketid = 0;
-                            conntrack[i].outfin = 0; conntrack[i].infin = 0; conntrack[i].ccssent = 0;
-                            conntrack[i].retransmits = 0; conntrack[i].lastack = 0;
-                            #ifdef TLSDEBUG
-                            printf("annihilated%s.\n", *(conntrack_packet + conntrackhdrLen + 13) & 0b00000100 > 0 ? " [RST]" : "");
-                            #endif
-                        }
-                        else {
-                            if ((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443)) {
-                                //*((unsigned short*)(conntrack_packet + 4)) = htons(conntrack[i].nextpacketid++);
-                                newpacketid(conntrack_packet);
-                                *((unsigned int*)(conntrack_packet + conntrackhdrLen + 4)) = htonl(conntrack_seq + conntrack[i].offset);
-                                #ifdef TLSDEBUG
-                                printf("old conntrack seq: %u, new conntrack seq: %u, packet length: %u, payload length: %u\n", conntrack[i].upperseq, conntrack[i].upperseq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset), conntrack_packetLen, (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset));
-                                #endif
-                                if (no_ccs && !conntrack[i].ccssent && (conntrack_packet[conntrackhdrLen + conntrackdataOffset] == 0x14 && conntrack_packet[conntrackhdrLen + conntrackdataOffset + 1] == 3 && (conntrack_packet[conntrackhdrLen + conntrackdataOffset + 2] > 0 && conntrack_packet[conntrackhdrLen + conntrackdataOffset + 2] < 5))) {
-                                    conntrack[i].offset -= 5 + ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen + conntrackdataOffset + 3)));
-                                    conntrack_packetLen -= 5 + ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen + conntrackdataOffset + 3))); //I could've just made it subtrack 6. But the robustness calls.
-                                    memmove(conntrack_packet + conntrackhdrLen + conntrackdataOffset, conntrack_packet + conntrackhdrLen + conntrackdataOffset + 5 + ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen + conntrackdataOffset + 3))), conntrack_packetLen - conntrackhdrLen - conntrackdataOffset);
-                                    *((unsigned int*)(conntrack_packet + 2)) = htons(conntrack_packetLen);
-                                    conntrack[i].ccssent = 1;
-                                }
-                                if (conntrack_seq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset) == conntrack[i].upperseq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset)) { //A healthy packet. Connection tracking can be done safely.
-                                    if ((conntrack[i].upperseq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset)) < conntrack[i].upperseq) { //Wrapping around...
-                                        printf("Wrapping around.\n");
-                                        conntrack[i].lowerseq = conntrack[i].upperseq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset);
-                                    }
-                                    conntrack[i].upperseq += (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset);
-                                    conntrack[i].retransmits = 0;
-                                }
-                                else if (conntrack_seq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset) > conntrack[i].upperseq) //A traffic anomaly. Not something that should ever happen, but I am not hoping for everything to be valid.
-                                    conntrack[i].upperseq = conntrack_seq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset);
-                                else { //It's a retransmit. It should probably be handled somehow.
-                                    switch (conntrack[i].retransmits) {
-                                        case 0: //Try doing reverse fragmentation.
-                                            if (https_fragment_size && https_fragment_size < (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset)) {
-                                                conntrack_should_reinject = 0;
-                                                memcpy(conntrack_fragholder, conntrack_packet, conntrackhdrLen + conntrackdataOffset);
-                                                //Thinking with pointers.
-                                                memcpy(conntrack_fragholder + conntrackhdrLen + conntrackdataOffset, conntrack_packet + conntrackhdrLen + conntrackdataOffset + https_fragment_size, conntrack_packetLen - conntrackhdrLen - conntrackdataOffset - https_fragment_size);
-                                                *((unsigned int*)(conntrack_fragholder + conntrackhdrLen + 4)) = htonl(conntrack_seq + conntrack[i].offset + https_fragment_size);
-                                                *((unsigned int*)(conntrack_fragholder + 2)) = htons(conntrack_packetLen - https_fragment_size);
-                                                WinDivertHelperCalcChecksums(conntrack_fragholder, conntrack_packetLen - https_fragment_size, &conntrack_addr, 0);
-                                                WinDivertSend(conntrack_filter, conntrack_fragholder, conntrack_packetLen - https_fragment_size, NULL, &conntrack_addr);
-                                                //Now the second one.
-                                                memcpy(conntrack_fragholder + conntrackhdrLen + conntrackdataOffset, conntrack_packet + conntrackhdrLen + conntrackdataOffset, https_fragment_size);
-                                                *((unsigned int*)(conntrack_fragholder + conntrackhdrLen + 4)) = htonl(conntrack_seq + conntrack[i].offset);
-                                                *((unsigned int*)(conntrack_fragholder + 2)) = htons(https_fragment_size + conntrackhdrLen + conntrackdataOffset);
-                                                //*((unsigned short*)(conntrack_fragholder + 4)) = htons(conntrack[i].nextpacketid++);
-                                                newpacketid(conntrack_fragholder);
-                                                WinDivertHelperCalcChecksums(conntrack_fragholder, https_fragment_size + conntrackhdrLen + conntrackdataOffset, &conntrack_addr, 0);
-                                                WinDivertSend(conntrack_filter, conntrack_fragholder, https_fragment_size + conntrackhdrLen + conntrackdataOffset, NULL, &conntrack_addr);
-                                            }
-                                            break;
-                                        default: //Nothing's working, so let's fuck around and see what information we can gather.
-                                            *((unsigned short*)(conntrack_packet + 4)) = 12345; //Sign it.
-                                            *((unsigned int*)(conntrack_packet + conntrackhdrLen + 4)) = htonl(conntrack_seq - 200); //Send it in the past. See what happens.
-                                            *((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)) = htonl(ntohl(*((unsigned int*)(conntrack_packet + conntrackhdrLen + 8))) + 200); //Send it also acknowledging the future. See what happens.
-                                    }
-                                    conntrack[i].retransmits++;
-                                }
+                    if (!conntrack[i].busy && conntrack[i].ip == conntrack_ip && ((conntrack_outbound ? conntrack_seq : conntrack_seq - conntrack[i].offset) >= conntrack[i].lowerseq && (conntrack_outbound ? conntrack_seq : conntrack_seq - conntrack[i].offset) <= conntrack[i].upperseq)) {
+                        if (*(conntrack_packet + conntrackhdrLen + 13) & 0b00000001) {
+                            if (conntrack_outbound) {
+                                printf("OUTBOUND FIN\n");
+                                conntrack[i].outfin = 1;
                             }
                             else {
-                                *((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)) = htonl(conntrack_seq - conntrack[i].offset);
+                                printf("INBOUND FIN\n");
+                                conntrack[i].infin = 1;
                             }
-                            #ifdef TLSDEBUG
-                            printf("I did it! for ip %u.%u.%u.%u, associated SNI %s, %s\n", ((unsigned char*)&(conntrack[i].ip))[0], ((unsigned char*)&(conntrack[i].ip))[1], ((unsigned char*)&(conntrack[i].ip))[2], ((unsigned char*)&(conntrack[i].ip))[3], conntrack[i].associatedsni, (conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) ? "Outbound" : "Inbound");
-                            #endif
                         }
+                        if (conntrack[i].infin && conntrack[i].outfin && (*(conntrack_packet + conntrackhdrLen + 13) & 0b00010000) > 0) {
+                            printf("FINALIZING\n");
+                            final_ack = 1;
+                            *((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)) = htonl(conntrack_seq - conntrack[i].offset);
+                        }
+                        if (final_ack || ((*(conntrack_packet + conntrackhdrLen + 13) & 0b00000100) > 0)) { //Annihilate the conntrack connection if this packet fully terminates the connection.
+                            conntrack[i].busy = 0; conntrack[i].ip = 0; conntrack[i].lowerseq = 0; 
+                            conntrack[i].upperseq = 0; conntrack[i].offset = 0; conntrack[i].originseq = 0; 
+                            conntrack[i].nextpacketid = 0;
+                            conntrack[i].outfin = 0; conntrack[i].infin = 0;
+                            conntrack[i].retransmits = 0;
+                        }
+                        if (conntrack_outbound) {
+                            //*((unsigned short*)(conntrack_packet + 4)) = htons(conntrack[i].nextpacketid++);
+                            newpacketid(conntrack_packet);
+                            *((unsigned int*)(conntrack_packet + conntrackhdrLen + 4)) = htonl(conntrack_seq + conntrack[i].offset);
+                            if (conntrack_seq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset) == conntrack[i].upperseq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset)) { //A healthy packet. Connection tracking can be done safely.
+                                if ((conntrack[i].upperseq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset)) < conntrack[i].upperseq) { //Wrapping around...
+                                    printf("Wrapping around.\n");
+                                    conntrack[i].lowerseq = conntrack[i].upperseq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset);
+                                }
+                                conntrack[i].upperseq += (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset);
+                                conntrack[i].retransmits = 0;
+                            }
+                            else if (conntrack_seq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset) > conntrack[i].upperseq) //A traffic anomaly. Not something that should ever happen, but I am not hoping for everything to be valid.
+                                conntrack[i].upperseq = conntrack_seq + (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset);
+                            else { //It's a retransmit. It should probably be handled somehow.
+                                switch (conntrack[i].retransmits++) {
+                                    case 0: //Try doing reverse fragmentation.
+                                        if (https_fragment_size && https_fragment_size < (conntrack_packetLen - conntrackhdrLen - conntrackdataOffset)) {
+                                            conntrack_should_reinject = 0;
+                                            memcpy(conntrack_fragholder, conntrack_packet, conntrackhdrLen + conntrackdataOffset);
+                                            //Thinking with pointers.
+                                            memcpy(conntrack_fragholder + conntrackhdrLen + conntrackdataOffset, conntrack_packet + conntrackhdrLen + conntrackdataOffset + https_fragment_size, conntrack_packetLen - conntrackhdrLen - conntrackdataOffset - https_fragment_size);
+                                            *((unsigned int*)(conntrack_fragholder + conntrackhdrLen + 4)) = htonl(conntrack_seq + conntrack[i].offset + https_fragment_size);
+                                            *((unsigned int*)(conntrack_fragholder + 2)) = htons(conntrack_packetLen - https_fragment_size);
+                                            WinDivertHelperCalcChecksums(conntrack_fragholder, conntrack_packetLen - https_fragment_size, &conntrack_addr, 0);
+                                            WinDivertSend(conntrack_filter, conntrack_fragholder, conntrack_packetLen - https_fragment_size, NULL, &conntrack_addr);
+                                            //Now the second one.
+                                            memcpy(conntrack_fragholder + conntrackhdrLen + conntrackdataOffset, conntrack_packet + conntrackhdrLen + conntrackdataOffset, https_fragment_size);
+                                            *((unsigned int*)(conntrack_fragholder + conntrackhdrLen + 4)) = htonl(conntrack_seq + conntrack[i].offset);
+                                            *((unsigned int*)(conntrack_fragholder + 2)) = htons(https_fragment_size + conntrackhdrLen + conntrackdataOffset);
+                                            //*((unsigned short*)(conntrack_fragholder + 4)) = htons(conntrack[i].nextpacketid++);
+                                            newpacketid(conntrack_fragholder);
+                                            WinDivertHelperCalcChecksums(conntrack_fragholder, https_fragment_size + conntrackhdrLen + conntrackdataOffset, &conntrack_addr, 0);
+                                            WinDivertSend(conntrack_filter, conntrack_fragholder, https_fragment_size + conntrackhdrLen + conntrackdataOffset, NULL, &conntrack_addr);
+                                        }
+                                        break;
+                                    default: //Nothing's working, so let's fuck around and see what information we can gather.
+                                        *((unsigned short*)(conntrack_packet + 4)) = 12345; //Sign it.
+                                        *((unsigned int*)(conntrack_packet + conntrackhdrLen + 4)) = htonl(conntrack_seq - 200); //Send it in the past. See what happens.
+                                        *((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)) = htonl(ntohl(*((unsigned int*)(conntrack_packet + conntrackhdrLen + 8))) + 200); //Send it also acknowledging the future. See what happens.
+                                }
+                            }
+                        }
+                        else {
+                            *((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)) = htonl(conntrack_seq - conntrack[i].offset);
+                        }
+                        break; //WHY DID I FORGET THIS??????????????????????????????
                     }
                     else if (conntrack[i].ip == conntrack_ip) {
-                        if (conntrack_ip == 0x0100007F) printf("partial match, direction: %s, IP: %u.%u.%u.%u, SEQs: packet: %u, origin seq: %u, conntrack lower bound: %u, conntrack upper bound: %u, offset: %u\n", ((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443)) ? "Outbound" : "Inbound", ((unsigned char*)&(conntrack[i].ip))[0], ((unsigned char*)&(conntrack[i].ip))[1], ((unsigned char*)&(conntrack[i].ip))[2], ((unsigned char*)&(conntrack[i].ip))[3], conntrack_seq, conntrack[i].originseq, conntrack[i].lowerseq, conntrack[i].upperseq, conntrack[i].offset);
-                        if ((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) && conntrack_seq > conntrack[i].upperseq && conntrack_seq - conntrack[i].upperseq < 600) printf("proximity alert, this likely means a missed packet and conntrack is failing. (%s)\n", (conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) ? "Outbound" : "Inbound");
-                        if ((conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) && conntrack_seq < conntrack[i].lowerseq && conntrack_seq >= conntrack[i].originseq) { //An evil retransmit. block it so it doesn't clobber everything.
-                            conntrack_should_reinject = 0;
-                            #ifdef TLSDEBUG
-                            printf("Retransmit blocked\n");
-                            #endif
-                        }
-                        if (!(conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) && conntrack_seq > conntrack[i].originseq && conntrack_seq < conntrack[i].lowerseq) { //Early ACK, it should not be received. Block it.
-                            conntrack_should_reinject = 0;
-                            #ifdef TLSDEBUG
-                            printf("Early ACK blocked\n");
-                            #endif
-                        }
+                        if (conntrack_outbound && conntrack_seq > conntrack[i].upperseq && conntrack_seq - conntrack[i].upperseq < 600) printf("proximity alert, this likely means a missed packet and conntrack is failing. (%s)\n", (conntrack_addr.Outbound && ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen))) != 443) ? "Outbound" : "Inbound");
+                        if (conntrack_seq < conntrack[i].lowerseq && conntrack_seq >= conntrack[i].originseq) conntrack_should_reinject = 0;
                     }
                 }
-                /*if (*(conntrack_packet + conntrackhdrLen + 13) == 0b00000010 && conntrack_addr.Outbound && mss > 0) {
-                    printf("MSS!\n");
-                    findmss = 0;
-                    //Locate the MSS option.
-                    for (int i = 0; i < conntrackdataOffset; i += conntrack_packet[conntrackhdrLen + i] > 1 ? ntohs(*((unsigned short*)(conntrack_packet + conntrackhdrLen + i + 1))) : 1) { //Actually cramming logic in there. Amazing.
-                        if (conntrack_packet[conntrackhdrLen + i] == 2) {
-                            findmss = i + 2;
-                            break;
-                        }
-                    }
-                    if (findmss != 0) {
-                        *((unsigned short*)(conntrack_packet + conntrackhdrLen + findmss)) = htons(mss);
-                    }
-                    else { //If there isn't one, make one.
-                        //Make space for the MSS option.
-                        memmove(conntrack_packet + conntrackhdrLen + conntrackdataOffset + 4, conntrack_packet + conntrackhdrLen + conntrackdataOffset, conntrack_packetLen - conntrackdataOffset - conntrackhdrLen);
-                        //Attach MSS Option to packet, overwrite options terminator.
-                        conntrack_packet[conntrackhdrLen + conntrackdataOffset - 1] = 2;
-                        conntrack_packet[conntrackhdrLen + conntrackdataOffset] = 4;
-                        *((unsigned short*)(conntrack_packet + conntrackhdrLen + conntrackdataOffset + 1)) = htons(mss);
-                        //Make a new options terminator.
-                        conntrack_packet[conntrackhdrLen + conntrackdataOffset + 3] = 0;
-                        conntrack_packet[conntrackhdrLen + 12] += 0x10;
-                    }
-                    WinDivertHelperCalcChecksums(conntrack_packet, conntrack_packetLen, &conntrack_addr, 0);
-                }
-                */
                 WinDivertHelperCalcChecksums(conntrack_packet, conntrack_packetLen, &conntrack_addr, 0);
                 if (conntrack_should_reinject) {
                     WinDivertSend(conntrack_filter, conntrack_packet, conntrack_packetLen, NULL, &conntrack_addr);
@@ -2185,7 +2123,7 @@ int main(int argc, char *argv[]) {
                 break;
             }
         }
-        //printf("terminated\n");
+        else printf("conntrack init error %u\n", GetLastError());
     }
     // Make sure to search DLLs only in safe path, not in current working dir.
     SetDllDirectory("");
@@ -2414,8 +2352,18 @@ int main(int argc, char *argv[]) {
                     printf("WARNING: Whitelist and blacklist specified. Whitelist has no effect.");
                 }
                 break;
+            case 'B':
+                illegal_segments = 1;
+                if (!blackwhitelist_load_list(optarg, 3)) {
+                    printf("Can't load fake SNI map from file!\n");
+                    exit(ERROR_BLACKLIST_LOAD);
+                }
+                break;
             case 'w':
                 do_http_allports = 1;
+                break;
+            case 'W':
+                fnroor = 1;
                 break;
             case 'V': // --vortex-frag-by-sni
                 vortex_frag_by_sni = 1;
@@ -2440,9 +2388,6 @@ int main(int argc, char *argv[]) {
                 i = atousi(optarg, "IP ID parameter error!\n");
                 add_ip_id_str(i);
                 i = 0;
-                break;
-            case 'I': // --fragnt
-                fragnt = 1;
                 break;
             case 'A':
                 vortex_step_left = atousi(optarg, "Step bias should be in range [1 - 4]\n") > 0 ? atousi(optarg, "Step bias should be in range [1 - 4]\n") : 1;
@@ -2650,7 +2595,7 @@ int main(int argc, char *argv[]) {
                 " --blacklist   <txtfile>  perform circumvention tricks only to host names and subdomains from\n"
                 "                          supplied text file (HTTP Host/TLS SNI).\n"
                 "                          This option can be supplied multiple times.\n"
-                " --whitelist   <txtfile>  do not perform circumvention tricks only to host names and subdomains from\n"
+                " --whitelist   <txtfile>  do not perform circumvention tricks to host names and subdomains from\n"
                 "                          supplied text file (HTTP Host/TLS SNI).\n"
                 "                          This option can be supplied multiple times.\n"
                 " --allow-no-sni           perform circumvention if TLS SNI can't be detected with --blacklist enabled.\n"
@@ -2892,7 +2837,7 @@ int main(int argc, char *argv[]) {
      * active DPI circumvention
      */
     filters[filter_num] = init(filter_string, 0);
-    printf("My filter is %s\n", filter_string);
+    //printf("My filter is %s\n", filter_string);
     w_filter = filters[filter_num];
     filter_num++;
 
@@ -3025,6 +2970,22 @@ int main(int argc, char *argv[]) {
                         }
                         fatass[freeWaiting].seq = 0;
                         fatass[freeWaiting].ip = 0;
+                        if (
+                             (do_blacklist && sni_ok &&
+                              blackwhitelist_check_hostname(host_addr, host_len, 0, NULL)
+                             ) ||
+                             (do_blacklist && !sni_ok && do_allow_no_sni) ||
+                             (sni_ok && !do_blacklist && (!do_whitelist || (do_whitelist && blackwhitelist_check_hostname(host_addr, host_len, 1, NULL))))
+                           )
+                        {
+                            if (do_fake_packet) {
+                                TCP_HANDLE_OUTGOING_FAKE_PACKET(send_fake_https_request);
+                            }
+                            if (do_native_frag) {
+                                // Signal for native fragmentation code handler
+                                should_recalc_checksum = 1;
+                            }
+                        }
                     }
                     else if (freeWaiting == -1 && packet_dataLen > 41) {
                         if (istlshandshake(packet_data) && packet_data[5] == 1 && (ntohs(*((unsigned short*)(packet_data + 3))) + 5) > packet_dataLen) {
@@ -3100,10 +3061,10 @@ int main(int argc, char *argv[]) {
                         }
                         if (
                              (do_blacklist && sni_ok &&
-                              blackwhitelist_check_hostname(host_addr, host_len, 0)
+                              blackwhitelist_check_hostname(host_addr, host_len, 0, NULL)
                              ) ||
                              (do_blacklist && !sni_ok && do_allow_no_sni) ||
-                             (sni_ok && !do_blacklist && (!do_whitelist || (do_whitelist && blackwhitelist_check_hostname(host_addr, host_len, 1))))
+                             (sni_ok && !do_blacklist && (!do_whitelist || (do_whitelist && blackwhitelist_check_hostname(host_addr, host_len, 1, NULL))))
                            )
                         {
                             if (do_fake_packet) {
@@ -3130,9 +3091,9 @@ int main(int argc, char *argv[]) {
                     if (find_header_and_get_info(packet_data, packet_dataLen,
                         http_host_find, &hdr_name_addr, &hdr_value_addr, &hdr_value_len) &&
                         hdr_value_len > 0 && hdr_value_len <= HOST_MAXLEN &&
-                        (do_blacklist ? blackwhitelist_check_hostname(hdr_value_addr, hdr_value_len, 0) : 1))
+                        (do_blacklist ? blackwhitelist_check_hostname(hdr_value_addr, hdr_value_len, 0, NULL) : 1))
                     {
-                        if (do_whitelist && !do_blacklist ? blackwhitelist_check_hostname(hdr_value_addr, hdr_value_len, 1) : 1) proceed = 1;
+                        if (do_whitelist && !do_blacklist ? blackwhitelist_check_hostname(hdr_value_addr, hdr_value_len, 1, NULL) : 1) proceed = 1;
                         host_addr = hdr_value_addr;
                         host_len = hdr_value_len;
 #ifdef DEBUG
@@ -3251,6 +3212,7 @@ int main(int argc, char *argv[]) {
                         }
                     }
                     if ((sni_fragment_size || tls_absolute_frag || tls_rando_frag) && sni_ok && packet_v4) {
+                        illegalSegmentLen = 0;
                         addoffset = 0;
                         beginSni = 0;
                         fragmentInfoLen = 0;
@@ -3264,10 +3226,27 @@ int main(int argc, char *argv[]) {
                         xprint(host_addr, host_len, 0);
                         printf("\n");
                         #endif
-                        #ifdef OBSERVATION
-                        printf("SNI distance from BEGINNING/END: %u/%u\n", (unsigned int)(host_addr - packet) - hdrLen - dataOffset, (unsigned int)((packet + packetLen) - (host_addr + host_len)));
-                        #endif
                         //printf("PACKET LENGTH: %u\n", packetLen);
+                        if (blackwhitelist_check_hostname(host_addr, host_len, 3, fakehost)) {
+                            printf("MATCH!\n", fakehost);
+                            struct clienthello clienthello;
+                            parse_clienthello(packet, &clienthello);
+                            for (unsigned short i = 0; i < clienthello.extensionCount; i++) {
+                                if (clienthello.extensions[i].type == 0) {
+                                    free(clienthello.extensions[i].data);
+                                    clienthello.extensions[i].data = malloc(strlen(fakehost) + 5);
+                                    unsigned char* sni = clienthello.extensions[i].data;
+                                    clienthello.extensions[i].length = strlen(fakehost) + 5;
+                                    *((unsigned short*)(sni)) = htons(strlen(fakehost) + 3);
+                                    sni[2] = 0;
+                                    *((unsigned short*)(sni + 3)) = htons(strlen(fakehost)); //Far too much work.
+                                    memcpy(sni + 5, fakehost, strlen(fakehost));
+                                }
+                            }
+                            memcpy(illegalSegment, packet, hdrLen + dataOffset);
+                            illegalSegmentLen = rebuild_clienthello(&clienthello, illegalSegment + hdrLen + dataOffset) + hdrLen + dataOffset;
+                            convert_endian(illegalSegment + 2, &illegalSegmentLen, 2);
+                        }
                         convert_endian(&tcpBaseSeq, packet + hdrLen + 4, 4);
                         tcpBaseSeqTrue = tcpBaseSeq;
                         analyze_hlen = (packet[0] & 0b00001111) * 4;
@@ -4018,6 +3997,7 @@ int main(int argc, char *argv[]) {
                             if (record_frag) mode = 3;
                             else if (vortex_frag) mode = 1;
                             else if (rplrr) mode = 2;
+                            else if (fnroor) mode = 4;
                             do_super_reverse_frag(mode, fragmentInfo, fragmentInfoLen, packetBACK, tcpBaseSeqTrue);
                         }
                         #ifdef DEBUG
@@ -4154,6 +4134,12 @@ int main(int argc, char *argv[]) {
                     WinDivertHelperCalcChecksums(packet, packetLen, &addr, (UINT64)0LL);
                 }
                 WinDivertSend(w_filter, packet, packetLen, NULL, &addr);
+                for (int i = 0; i < connectionslen; i++) {
+                    if (connections[i].taken && connections[i].ip == *((unsigned int*)(packet + 16)) && connections[i].seq == ntohl(*((unsigned int*)(packet + hdrLen + 4)))) {
+                        connections[i].taken = 0;
+                        break;
+                    }
+                }
             }
         }
         else {
