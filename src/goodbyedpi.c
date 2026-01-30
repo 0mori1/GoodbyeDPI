@@ -1424,7 +1424,7 @@ struct conntracksig { //Rudimentary conntrack. This also means that if you shut 
     unsigned int upperseq; //SEQ upper bound
     unsigned int lowerseq; //SEQ lower bound
     unsigned int originseq;
-    unsigned int inboundseq;
+    unsigned int remoteseq;
     unsigned short clientport;
     unsigned short nextpacketid;
     unsigned short mss;
@@ -1566,7 +1566,7 @@ int main(int argc, char *argv[]) {
     void do_fragmentation(unsigned char* packet) { //By moving fragmentation into this function, I can put it in many other things.
 
     }
-    void do_super_reverse_frag(unsigned char mode, struct fragmentInfoChunk* fragmentInfo, unsigned short fragmentInfoLen, unsigned char* srcPacket, unsigned int tcpBaseSeq) {
+    void do_super_reverse_frag(unsigned char mode, struct fragmentInfoChunk* fragmentInfo, unsigned short fragmentInfoLen, unsigned char* srcPacket, unsigned int tcpBaseSeq, unsigned short baseid) {
         unsigned char hdrLen = (srcPacket[0] & 0b00001111) * 4;
         unsigned char dataOffset = (srcPacket[hdrLen + 12] >> 4) * 4;
         unsigned short totalLength;
@@ -1755,6 +1755,7 @@ int main(int argc, char *argv[]) {
                 for (int i = 0; i < host_len; i++) {
                     conntrack[freeWaiting].associatedsni[i] = host_addr[i];
                 }
+                conntrack[freeWaiting].clientport = ntohs((*((unsigned short*)(srcPacket + hdrLen))));
                 conntrack[freeWaiting].associatedsni[host_len] = 0;
                 conntrack[freeWaiting].nextpacketid = ntohs(*((unsigned short*)(srcPacket + 4)));
                 conntrack[freeWaiting].outfin = 0; 
@@ -1820,6 +1821,7 @@ int main(int argc, char *argv[]) {
                     );
                     progress += current_fragment_size;
                 }
+                conntrack[freeWaiting].nextpacketid = ntohs(*((unsigned short*)(srcPacket + 4))) + fragmentInfoLen;
                 memmove(recordbuffer + hdrLen + dataOffset, recordbuffer, tls_len);
                 memcpy(recordbuffer, packetBACK, hdrLen + dataOffset);
                 mode = 0;
@@ -1828,7 +1830,7 @@ int main(int argc, char *argv[]) {
                 else if (illegal_segments && illegalSegmentLen > 0) mode = 4;
                 //printf("Sending %u fragments.\n", fragmentInfoLen);
                 if (!tls_force_native)
-                do_super_reverse_frag(mode, fragmentInfo, fragmentInfoLen, recordbuffer, tcpBaseSeqTrue);
+                do_super_reverse_frag(mode, fragmentInfo, fragmentInfoLen, recordbuffer, tcpBaseSeqTrue, 0);
                 #ifdef TLSPRINT
                 xprint(srcPacket + hdrLen + dataOffset + 5, packetLen - dataOffset - hdrLen, 40);
                 printf("\n\n");
@@ -1839,6 +1841,7 @@ int main(int argc, char *argv[]) {
                 #endif
                 break;
             case 4: // Internal fragmentation mode for record fragmentation.
+                tcpBaseSeqTrue = tcpBaseSeq;
                 unsigned short mss = 1200;
                 for (int i = 0; i < connectionslen; i++) {
                     if (connections[i].taken && connections[i].ip == *((unsigned int*)(srcPacket + 16)) && connections[i].seq == ntohl(*((unsigned int*)(srcPacket + hdrLen + 4)))) {
@@ -1850,14 +1853,17 @@ int main(int argc, char *argv[]) {
                 if (mss == 1200) printf("ERROR: CONNECTION TRACKING FAIL\n");
                 tcpBaseSeq -= illegalSegmentLen - hdrLen - dataOffset;
                 for (int i = 0; i < fragmentInfoLen; i++) {
+                    printf("fragment %u\n", i + 1);
                     totalLength = illegalSegmentLen + fragmentInfo[i].payloadLen;
                     memcpy(illegalSegment + illegalSegmentLen, srcPacket + hdrLen + dataOffset + (fragmentInfo[i].seq - tcpBaseSeqTrue), fragmentInfo[i].payloadLen);
                     progress = 0;
                     static unsigned short auxTotalLength = 0;
                     while (progress != totalLength - hdrLen - dataOffset) {
+                        printf("processing %u/%u\n", progress, totalLength - hdrLen - dataOffset);
                         current_fragment_size = mss;
-                        if (hdrLen + dataOffset + progress + current_fragment_size >= totalLength) { //Uh oh.
-                            current_fragment_size = (unsigned int) (illegalSegmentLen - hdrLen - dataOffset - progress);
+                        if (progress + current_fragment_size >= totalLength - hdrLen - dataOffset) { //Uh oh.
+                            current_fragment_size = (unsigned int) (totalLength - hdrLen - dataOffset - progress);
+                            printf("Uh oh! %u\n", current_fragment_size);
                             if (current_fragment_size == 0) break;
                         }
                         memcpy(fragmentHolder + hdrLen + dataOffset, illegalSegment + hdrLen + dataOffset + progress, current_fragment_size);
@@ -1886,7 +1892,10 @@ int main(int argc, char *argv[]) {
                     convert_endian(fragmentHolder + hdrLen + 4, &tcpSeq, 4);
                     convert_endian(fragmentHolder + 2, &totalLength, 2);
                     memcpy(fragmentHolder + hdrLen + dataOffset, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset);
-                    newpacketid(fragmentHolder);
+                    if (!baseid) newpacketid(fragmentHolder);
+                    else {
+                        *((unsigned short*)(srcPacket + 4)) = htons(baseid++);
+                    }
                     WinDivertHelperCalcChecksums(
                         fragmentHolder, totalLength, &addr, 0
                     );
@@ -1911,16 +1920,10 @@ int main(int argc, char *argv[]) {
                 //Encapsulate in trash
                 xorinate(thrash_fake + 28, 20 % (thrash_packetLen - 28), "IAMTHRASH", 9);
 			    WinDivertHelperCalcChecksums(thrash_fake, thrash_packetLen, &thrash_addr, 0);
-                #ifdef DEBUG
-                printf("Sending %u fakes!\n", udp_fakes / 2 + udp_fakes % 2);
-                #endif
                 for (int i = 0; i < (udp_fakes / 2 + udp_fakes % 2); i++) {
                     WinDivertSend(thrash_filter, thrash_fake, thrash_packetLen, NULL, &thrash_addr);
                 }
                 WinDivertSend(thrash_filter, thrash_packet, thrash_packetLen, NULL, &thrash_addr);
-                #ifdef DEBUG
-                printf("Sending %u fakes!\n", udp_fakes / 2);
-                #endif
                 for (int i = 0; i < (udp_fakes / 2); i++) {
                     WinDivertSend(thrash_filter, thrash_fake, thrash_packetLen, NULL, &thrash_addr);
                 }
@@ -1960,7 +1963,8 @@ int main(int argc, char *argv[]) {
                         }
                     }
                     if (connfreewaiting == -1 && connectionslen == 512) {
-                        printf("CRAP CRAP CRAP CRAP\n");
+                        printf("FATAL SYNNING ERROR\n");
+                        break;
                     }
                     else if (connfreewaiting == -1) {
                         connfreewaiting = connectionslen++;
@@ -2053,13 +2057,6 @@ int main(int argc, char *argv[]) {
                             final_ack = 1;
                             *((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)) = htonl(conntrack_seq - conntrack[i].offset);
                         }
-                        if (final_ack || ((*(conntrack_packet + conntrackhdrLen + 13) & 0b00000100) > 0)) { //Annihilate the conntrack connection if this packet fully terminates the connection.
-                            conntrack[i].busy = 0; conntrack[i].ip = 0; conntrack[i].lowerseq = 0; 
-                            conntrack[i].upperseq = 0; conntrack[i].offset = 0; conntrack[i].originseq = 0; 
-                            conntrack[i].nextpacketid = 0;
-                            conntrack[i].outfin = 0; conntrack[i].infin = 0;
-                            conntrack[i].retransmits = 0;
-                        }
                         if (conntrack_outbound) {
                             //*((unsigned short*)(conntrack_packet + 4)) = htons(conntrack[i].nextpacketid++);
                             newpacketid(conntrack_packet);
@@ -2104,7 +2101,15 @@ int main(int argc, char *argv[]) {
                             }
                         }
                         else {
+                            conntrack[i].remoteseq = ntohl(*((unsigned int*)(conntrack_packet + conntrackhdrLen + 4)));
                             *((unsigned int*)(conntrack_packet + conntrackhdrLen + 8)) = htonl(conntrack_seq - conntrack[i].offset);
+                        }
+                        if (final_ack || ((*(conntrack_packet + conntrackhdrLen + 13) & 0b00000100) > 0)) { //Annihilate the conntrack connection if this packet fully terminates the connection.
+                            conntrack[i].busy = 0; conntrack[i].ip = 0; conntrack[i].lowerseq = 0; 
+                            conntrack[i].upperseq = 0; conntrack[i].offset = 0; conntrack[i].originseq = 0; 
+                            conntrack[i].nextpacketid = 0;
+                            conntrack[i].outfin = 0; conntrack[i].infin = 0;
+                            conntrack[i].retransmits = 0;
                         }
                         break; //WHY DID I FORGET THIS??????????????????????????????
                     }
@@ -2964,7 +2969,7 @@ int main(int argc, char *argv[]) {
                                     else add_fragment(fragmentHolder, fragmentInfo, &fragmentInfoLen);
                                     progress += current_fragment_size;
                                 }
-                                do_super_reverse_frag(0, fragmentInfo, fragmentInfoLen, packet, tcpBaseSeq);
+                                do_super_reverse_frag(0, fragmentInfo, fragmentInfoLen, packet, tcpBaseSeq, 0);
                                 should_reinject = 0;
                             }
                         }
@@ -3998,7 +4003,7 @@ int main(int argc, char *argv[]) {
                             else if (vortex_frag) mode = 1;
                             else if (rplrr) mode = 2;
                             else if (fnroor) mode = 4;
-                            do_super_reverse_frag(mode, fragmentInfo, fragmentInfoLen, packetBACK, tcpBaseSeqTrue);
+                            do_super_reverse_frag(mode, fragmentInfo, fragmentInfoLen, packetBACK, tcpBaseSeqTrue, 0);
                         }
                         #ifdef DEBUG
                         if (!smart_frag && compound_frag) packetLen += https_fragment_size;
