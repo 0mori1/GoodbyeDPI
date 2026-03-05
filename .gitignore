@@ -1,2 +1,6 @@
-*.o
-*.exe
+bin/
+lib/
+include/
+src/*.o
+src/.vscode/
+sync.sh
