@@ -2,11 +2,11 @@ ifndef MSYSTEM
 	CPREFIX = x86_64-w64-mingw32-
 endif
 
-WINDIVERTHEADERS = ../../../include
-WINDIVERTLIBS = ../../binary
+WINDIVERTHEADERS = ../include
+WINDIVERTLIBS = ../lib
 MINGWLIB = /usr/x86_64-w64-mingw32/lib/
 
-TARGET = goodbyedpi.exe
+TARGET = ../bin/goodbyedpi.exe
 # Linking SSP does not work for some reason, the executable doesn't start.
 #LIBS = -L$(WINDIVERTLIBS) -Wl,-Bstatic -lssp -Wl,-Bdynamic -lWinDivert -lws2_32
 LIBS = -L$(WINDIVERTLIBS) -lWinDivert -lws2_32 -l:libssp.a

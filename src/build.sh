@@ -1,0 +1,1 @@
+make CPREFIX=x86_64-w64-mingw32- BIT64=1 DEBUG=TRUE
