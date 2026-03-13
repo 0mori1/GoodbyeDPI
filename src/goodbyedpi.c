@@ -2165,6 +2165,7 @@ int main(int argc, char *argv[]) {
                     else fakebuilds[fakebuild.mode] = tempptr;
                     fakebuilds[fakebuild.mode][fakebuildlen[fakebuild.mode] - 1] = fakebuild;
                 }
+                break;
             case 'C': // --tls-recseg-size
                 tls_recseg_size = atousi(optarg, "Fragment size should be in range [0 - 65535]\n");
                 break;
