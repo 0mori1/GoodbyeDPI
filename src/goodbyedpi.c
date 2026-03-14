@@ -1517,7 +1517,7 @@ char conntrack_filter_str_default[] = "!tcp.Syn && !impostor and (((inbound or l
 unsigned int conntrack_maxlen = 0, conntrack_curlen = 0; 
 void* do_conntrack(void* something) {
     WINDIVERT_ADDRESS addr;
-    unsigned int seq, ip, packetLen;
+    unsigned int seq, nseq, ip, packetLen;
     unsigned short clientport = 0;
     unsigned char packet[65536], should_reinject = 0, hdrLen = 0, dataOffset = 0, final_ack = 0, outbound = 0;
     conntrack_filter = WinDivertOpen(conntrack_filter_str, WINDIVERT_LAYER_NETWORK, 2, 0);
@@ -1554,15 +1554,15 @@ void* do_conntrack(void* something) {
                     if (outbound) {
                         //*((unsigned short*)(packet + 4)) = htons(conntrack[i].nextpacketid++);
                         NEWPACKETID(packet);
-                        SETPTRTOUICE(packet + hdrLen + 4, conntrack[i].nextseq);
-                        if (0xFFFFFFFFu - (conntrack[i].nextseq - 1) <= (packetLen - hdrLen - dataOffset)) {
-                            printf("NOTE: ATTEMPTING WRAPAROUND FOR %s\n", conntrack[i].associatedsni);
-                            conntrack[i].nextseq = 0;
-                            conntrack[i].wrapoffset = 0xFFFFFFFFu - seq;
-                        }
-                        else conntrack[i].nextseq += (packetLen - hdrLen - dataOffset);
-                        if (seq + (packetLen - hdrLen - dataOffset) == conntrack[i].upperseq + (packetLen - hdrLen - dataOffset)) {
-                            if ((0xFFFFFFFFu - (conntrack[i].upperseq - 1)) <= (packetLen - hdrLen - dataOffset)) {
+                        if (seq == conntrack[i].upperseq) {
+                            SETPTRTOUICE(packet + hdrLen + 4, conntrack[i].nextseq);
+                            if (0xFFFFFFFFu - conntrack[i].nextseq + 1 <= (packetLen - hdrLen - dataOffset)) {
+                                printf("NOTE: ATTEMPTING WRAPAROUND FOR %s\n", conntrack[i].associatedsni);
+                                conntrack[i].nextseq = 0;
+                                conntrack[i].wrapoffset = 0xFFFFFFFFu - seq;
+                            }
+                            else conntrack[i].nextseq += (packetLen - hdrLen - dataOffset);
+                            if ((0xFFFFFFFFu - conntrack[i].upperseq + 1) <= (packetLen - hdrLen - dataOffset)) {
                                 printf("%s WRAPPING AROUND\n", conntrack[i].associatedsni);
                                 conntrack[i].lowerseq = 0;
                                 conntrack[i].upperseq = 0;
@@ -1570,9 +1570,14 @@ void* do_conntrack(void* something) {
                             else conntrack[i].upperseq += (packetLen - hdrLen - dataOffset);
                             conntrack[i].retransmits = 0;
                         }
-                        else if (seq + (packetLen - hdrLen - dataOffset) > conntrack[i].upperseq)
+                        else if (seq + (packetLen - hdrLen - dataOffset) > conntrack[i].upperseq) {
+                            nseq = conntrack[i].offset < (0xFFFFFFFF - seq + 1) ? seq + conntrack[i].offset : 0;
+                            SETPTRTOUICE(packet + hdrLen + 4, nseq);
                             conntrack[i].upperseq = seq + (packetLen - hdrLen - dataOffset);
+                        }
                         else {
+                            nseq = conntrack[i].offset < (0xFFFFFFFF - seq + 1) ? seq + conntrack[i].offset : 0;
+                            SETPTRTOUICE(packet + hdrLen + 4, nseq);
                             /*
                             switch (conntrack[i].retransmits++) {
                                 case 0:
