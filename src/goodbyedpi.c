@@ -22,7 +22,7 @@
 #include "fakepackets.h"
 #include <pthread.h>
 #include <time.h>
-#define MAX_PACKET_SIZE 2048
+#define MAX_PACKET_SIZE 4096 //A bit more memory...
 #define SHOWSNI
 #define FATASSMAXLIFE 256
 #define DOLOCALNETS
@@ -1047,6 +1047,8 @@ struct fragmentationParams {
     unsigned short ext_frag_size;
     unsigned short compound_frag; // >0 = Compound fragmentation enabled.
 };
+char host_addrBACK[HOST_MAXLEN];
+unsigned short host_lenBACK;
 void do_fragmentation(HANDLE filter, WINDIVERT_ADDRESS* pAddr, struct fragmentInfo* fragmentInfo, unsigned int tcpBaseSeq, unsigned char* packet, unsigned short packetLen,
     unsigned char* host_addr, unsigned short host_len, struct fragmentationParams* params, unsigned short* pprogress) {
     //printf("initializing fragmenter\n");
@@ -1823,11 +1825,11 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             conntrack[freeWaiting].offset = (fragmentInfoLen - 1) * 5;
             conntrack[freeWaiting].originseq = tcpBaseSeq;
             conntrack[freeWaiting].mss = mss;
-            for (unsigned int i = 0; i < host_len; i++) {
-                conntrack[freeWaiting].associatedsni[i] = host_addr[i];
+            for (unsigned int i = 0; i < host_lenBACK; i++) {
+                conntrack[freeWaiting].associatedsni[i] = host_addrBACK[i];
             }
             conntrack[freeWaiting].clientport = PTRTOUSCE(srcPacket + hdrLen);
-            conntrack[freeWaiting].associatedsni[host_len] = 0;
+            conntrack[freeWaiting].associatedsni[host_lenBACK] = 0;
             conntrack[freeWaiting].nextpacketid = PTRTOUSCE(srcPacket + 4);
             conntrack[freeWaiting].flags = conntrack[freeWaiting].flags & 0b11111011;
             tls_reassembly_progress = 0;
@@ -1857,7 +1859,7 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             memcpy(fragmentHolder, srcPacket, hdrLen + dataOffset);
             fragmentInfo->length = 0;
             //printf("fakemap check\n");
-            if (blackwhitelist_check_hostname(host_addr, host_len, 3, fakehost)) { //that's never getting a match LMAO
+            if (blackwhitelist_check_hostname(host_addrBACK, host_lenBACK, 3, fakehost)) {
                 printf("MATCH! (%s)\n", fakehost);
                 struct clienthello clienthello;
                 char foundpadding = 0;
@@ -2189,6 +2191,7 @@ int main(int argc, char *argv[]) {
                 else
                     udp_fakes = 1;
                 conntrack_filter_str = conntrack_filter_str_discord_vc;
+                synner_filter_str = synner_filter_str_discord_vc;
                 break;
             case 'd': // --dns-addr
                 if ((inet_pton(AF_INET, optarg, dns_temp_addr.s6_addr) == 1) &&
@@ -2816,11 +2819,11 @@ int main(int argc, char *argv[]) {
     if (max_payload_size) add_maxpayloadsize_str(max_payload_size);
     finalize_filter_strings();
     if (activate_thrash) {
-        pthread_create(&thrash_thread, NULL, &thrash, NULL);
+        pthread_create(&thrash_thread, NULL, thrash, NULL);
     }
     if (conntrack_maxlen) {
         conntrack = calloc(conntrack_maxlen, sizeof(struct conntracksig));
-        pthread_create(&conntrack_thread, NULL, &do_conntrack, NULL);
+        pthread_create(&conntrack_thread, NULL, do_conntrack, NULL);
     }
     //pthread_create(&synner_thread, NULL, &synner, NULL); //synner is actually a lot more important now.
     puts("\nOpening filter");
@@ -3218,6 +3221,8 @@ int main(int argc, char *argv[]) {
                         tcpBaseSeq = PTRTOUICE(packet + hdrLen + 4);
                         progress = 0;
                         fakePacketLen = 0;
+                        memcpy(host_addrBACK, host_addr, host_len);
+                        host_lenBACK = host_len;
                         #ifdef SHOWSNI
                         printf("processing ");
                         xprint(host_addr, host_len, 0);
