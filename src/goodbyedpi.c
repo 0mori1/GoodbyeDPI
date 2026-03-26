@@ -2265,8 +2265,8 @@ int main(int argc, char *argv[]) {
                     fakebuild.disorder = genrand16(randseed) % 3;
                     fakebuild.ttl = genrand16(randseed) % 256;
                     fakebuild.chksum = genrand16(randseed) % 2;
-                    fakebuild.badseq = genrand16(randseed) % 2;
-                    printf("MODE: %u TYPE %u FRAGMODE %u DISORDERING %u TTL %u CHECKSUM %u\n", fakebuild.mode, fakebuild.type, fakebuild.fragmentation, fakebuild.disorder, fakebuild.ttl, fakebuild.chksum);
+                    fakebuild.badseq = genrand16(randseed) % 3;
+                    printf("MODE: %u TYPE %u FRAGMODE %u DISORDERING %u TTL %u CHECKSUM %u, BADSEQ %u\n", fakebuild.mode, fakebuild.type, fakebuild.fragmentation, fakebuild.disorder, fakebuild.ttl, fakebuild.chksum);
                     void* tempptr = realloc(fakebuilds[fakebuild.mode], ++fakebuildlen[fakebuild.mode] * sizeof(struct fakebuild)); //Sucks, but that's too bad.
                     if (tempptr == NULL) {
                         printf("SHIT.\n");
@@ -2407,19 +2407,19 @@ int main(int argc, char *argv[]) {
                     }
                     else if (step != 4 && curchar >= '0' && curchar <= '9') {
                         ((unsigned char*)&fboverrides)[step] = curchar - '0';
-                        overriden = overriden | 1 << (5 - step++);
+                        overriden = overriden | 1 << (6 - step++);
                     }
                     else if (step == 4) {
                         if (curchar == '0' && ttlholdstep == 0) {
                             ((unsigned char*)&fboverrides)[step] = 0;
-                            overriden = overriden | 1 << (5 - step++);
+                            overriden = overriden | 1 << (6 - step++);
                         }
                         if (curchar >= '0' && curchar <= '9' && ttlholdstep < 3)
                             ttlhold[ttlholdstep++] = curchar;
                         else if (curchar == ':') {
                             ttlhold[ttlholdstep] = 0;
                             ((unsigned char*)&fboverrides)[step] = atousi(ttlhold, "Failed to parse TTL!");
-                            overriden = overriden | 1 << (5 - step++);
+                            overriden = overriden | 1 << (6 - step++);
                         }
                         else {
                             printf("Error processing TTL in %s!\n", optarg);
@@ -2846,11 +2846,11 @@ int main(int argc, char *argv[]) {
           );
     for (unsigned int x = 0; x < 4; x++)
         for (unsigned int y = 0; y < fakebuildlen[x]; y++)
-            printf("MODE: %u, TYPE: %u, FRAGMODE: %u, DISORDERING: %u, TTL: %u, CHECKSUM: %u\n", x, fakebuilds[x][y].type, fakebuilds[x][y].fragmentation, fakebuilds[x][y].disorder, fakebuilds[x][y].ttl, fakebuilds[x][y].chksum);
-    printf("OVERRIDES PATTERN: %u\nMODE: %u, TYPE: %u, FRAGMODE: %u, DISORDERING: %u, TTL: %u, CHECKSUM: %u\n", overriden, fboverrides.mode, fboverrides.type, fboverrides.fragmentation, fboverrides.disorder, fboverrides.ttl, fboverrides.chksum);
+            printf("MODE: %u, TYPE: %u, FRAGMODE: %u, DISORDERING: %u, TTL: %u, CHECKSUM: %u, BAD SEQ: %u\n", x, fakebuilds[x][y].type, fakebuilds[x][y].fragmentation, fakebuilds[x][y].disorder, fakebuilds[x][y].ttl, fakebuilds[x][y].chksum, fakebuilds[x][y].badseq);
+    printf("OVERRIDES PATTERN: %u\nMODE: %u, TYPE: %u, FRAGMODE: %u, DISORDERING: %u, TTL: %u, CHECKSUM: %u, BAD SEQ: %u\n", overriden, fboverrides.mode, fboverrides.type, fboverrides.fragmentation, fboverrides.disorder, fboverrides.ttl, fboverrides.chksum, fboverrides.badseq);
     //Process FB overrides
     if (overriden > 0) {
-        if (overriden & 0b100000)
+        if (overriden & 0b1000000)
             for (unsigned char x = 0; x < 4; x++) {
                 if (x != fboverrides.mode) {
                     for (unsigned int y = 0; y < fakebuildlen[x]; y++) fakebuilds[x][y].mode = fboverrides.mode;
@@ -2868,15 +2868,16 @@ int main(int argc, char *argv[]) {
             }
         for (unsigned char x = 0; x < 4; x++)
             for (unsigned int y = 0; y < fakebuildlen[x]; y++) {
-                if (overriden & 0b10000) fakebuilds[x][y].type = fboverrides.type;
-                if (overriden & 0b1000) fakebuilds[x][y].fragmentation = fboverrides.fragmentation;
-                if (overriden & 0b100) fakebuilds[x][y].disorder = fboverrides.disorder;
-                if (overriden & 0b10) fakebuilds[x][y].ttl = fboverrides.ttl;
-                if (overriden & 1) fakebuilds[x][y].chksum = fboverrides.chksum;
+                if (overriden & 0b100000) fakebuilds[x][y].type = fboverrides.type;
+                if (overriden & 0b10000) fakebuilds[x][y].fragmentation = fboverrides.fragmentation;
+                if (overriden & 0b1000) fakebuilds[x][y].disorder = fboverrides.disorder;
+                if (overriden & 0b100) fakebuilds[x][y].ttl = fboverrides.ttl;
+                if (overriden & 0b10) fakebuilds[x][y].chksum = fboverrides.chksum;
+                if (overriden & 0b1) fakebuilds[x][y].badseq = fboverrides.badseq;
             }
         for (unsigned int x = 0; x < 4; x++)
             for (unsigned int y = 0; y < fakebuildlen[x]; y++)
-                printf("MODE: %u, TYPE: %u, FRAGMODE: %u, DISORDERING: %u, TTL: %u, CHECKSUM: %u\n", x, fakebuilds[x][y].type, fakebuilds[x][y].fragmentation, fakebuilds[x][y].disorder, fakebuilds[x][y].ttl, fakebuilds[x][y].chksum);
+                printf("MODE: %u, TYPE: %u, FRAGMODE: %u, DISORDERING: %u, TTL: %u, CHECKSUM: %u, BAD SEQ: %u\n", x, fakebuilds[x][y].type, fakebuilds[x][y].fragmentation, fakebuilds[x][y].disorder, fakebuilds[x][y].ttl, fakebuilds[x][y].chksum, fakebuilds[x][y].badseq);
     }
     //Process Super Reverse parameters
     struct superReverseParams srparams;
