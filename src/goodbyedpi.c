@@ -284,6 +284,7 @@ static struct option long_options[] = {
     {"fake-randgen",required_argument, 0,  'Y' },
     {"fake-override",required_argument,0,  'X' },
     {"seq-offset",  required_argument, 0,  'I' },
+    {"set-seed",    required_argument, 0,  'M' },
     {0,             0,                 0,   0  }
 };
 
@@ -960,18 +961,12 @@ unsigned short rebuild_clienthello(struct clienthello* clienthello, unsigned cha
     return length + 5;
 }
 void delete_clienthello(struct clienthello* clienthello) { //Memory management!!!!!
-    printf("Freeing sessionid (if there is one)\n");
     if (clienthello->sessionidlen > 0) free(clienthello->sessionid);
-    printf("Freeing cipher suites\n");
     if (clienthello->ciphersuiteslen > 0) free(clienthello->ciphersuites);
-    printf("Freeing compression methods\n");
     if (clienthello->compressionmethodslen > 0) free(clienthello->compressionmethods);
-    printf("Freeing extensions\n");
     for (unsigned short i = 0; i < clienthello->extensionCount; i++) 
     if (clienthello->extensions[i].length > 0) free(clienthello->extensions[i].data);
-    printf("Freeing structs\n");
     free(clienthello->extensions);
-    printf("Finish\n");
 }
 //Reduced to a macro. What a glowdown.
 #ifndef SIGNATURE
@@ -1573,16 +1568,16 @@ void* do_conntrack(void* something) {
                 if ((conntrack[i].flags & 4) == 0 && conntrack[i].ip == ip && ((outbound ? seq : seq - conntrack[i].offset) >= conntrack[i].lowerseq && (outbound ? seq : seq - conntrack[i].offset) <= conntrack[i].upperseq)) {
                     if (*(packet + hdrLen + 13) & 0b00000001) {
                         if (outbound) {
-                            printf("OUTBOUND FIN\n");
+                            //printf("OUTBOUND FIN\n");
                             conntrack[i].flags = conntrack[i].flags | 2;
                         }
                         else {
-                            printf("INBOUND FIN\n");
+                            //printf("INBOUND FIN\n");
                             conntrack[i].flags = conntrack[i].flags | 1;
                         }
                     }
                     if ((conntrack[i].flags & 3) == 3 && (*(packet + hdrLen + 13) & 0b00010000) > 0) {
-                        printf("FINALIZING\n");
+                        //printf("FINALIZING\n");
                         final_ack = 1;
                         setptrtouice(packet + hdrLen + 8, seq - conntrack[i].offset);
                     }
@@ -1725,11 +1720,8 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
                 if (poi->badseq == 0) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq);
                 else if (poi->badseq == 1) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq + seq_offset);
                 else if (poi->badseq == 2) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq - selpacketlen - hdrLen - dataOffset);
-                printf("frag %u,%u,%u,%u;%u\n", fparams.mode, fparams.write_fragments, fparams.badchksum, fparams.tls_absolute_frag_size);
                 do_fragmentation(filter, pAddr, &tempinfo, 0, selpacket, selpacketlen, NULL, 0, &fparams, NULL);
-                printf("super reverse %u\n", sparams.flags);
                 if (poi->disorder > 0) do_super_reverse_frag(filter, pAddr, &sparams, &tempinfo, NULL, 0, selpacket, 0, ptrtouice(selpacket + hdrLen + 4), 0, NULL, 0);
-                printf("end\n");
             }
         }
     }
@@ -2028,11 +2020,8 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             struct superReverseParams sparams = {
                 .flags = 0b1000000 | poi->disorder == 2 ? 0b10 : 0,
             };
-            printf("frag %u,%u,%u,%u;%u\n", fparams.mode, fparams.write_fragments, fparams.badchksum, fparams.tls_absolute_frag_size);
             do_fragmentation(filter, pAddr, &tempinfo, tcpBaseSeq, selpacket, selpacketlen, NULL, 0, &fparams, NULL);
-            printf("super reverse %u\n", sparams.flags);
             if (poi->disorder > 0) do_super_reverse_frag(filter, pAddr, &sparams, &tempinfo, NULL, 0, selpacket, 0, tcpBaseSeq, 0, NULL, 0);
-            printf("end\n");
         }
     }
     //printf("Finish reverse\n");
@@ -2112,6 +2101,7 @@ int main(int argc, char *argv[]) {
     char *hdr_name_addr = NULL, *hdr_value_addr = NULL;
     unsigned int hdr_value_len;
     unsigned short randseed = time(NULL) % 0x10000;
+    printf("RANDOM SEED: %u\n", randseed);
     // Make sure to search DLLs only in safe path, not in current working dir.
     SetDllDirectory("");
     SetSearchPathMode(BASE_SEARCH_PATH_ENABLE_SAFE_SEARCHMODE | BASE_SEARCH_PATH_PERMANENT);
@@ -2255,6 +2245,9 @@ int main(int argc, char *argv[]) {
                 break;
             case 'm':
                 do_host_mixedcase = 1;
+                break;
+            case 'M':
+                randseed = atousi(optarg, "RANDOM SEED ASSIGNMENT ERROR...\n");
                 break;
             case 'Y':
                 unsigned int target = atousi(optarg, "Failed to process fake instruction random generation count!");
