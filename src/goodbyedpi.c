@@ -24,9 +24,10 @@
 #include <pthread.h>
 #include <time.h>
 #define MAX_PACKET_SIZE 4096 //A bit more memory...
-#define SHOWSNI
 #define FATASSMAXLIFE 256
+#define SHOWSNI
 #define DOLOCALNETS
+//#define SYNNER_NAG
 // My mingw installation does not load inet_pton definition for some reason
 WINSOCK_API_LINKAGE INT WSAAPI inet_pton(INT Family, LPCSTR pStringBuf, PVOID pAddr);
 
@@ -1063,8 +1064,6 @@ struct fragmentationParams {
     unsigned short ext_frag_size;
     unsigned short compound_frag; // >0 = Compound fragmentation enabled.
 };
-char host_addrBACK[HOST_MAXLEN];
-unsigned short host_lenBACK;
 void do_fragmentation(HANDLE filter, WINDIVERT_ADDRESS* pAddr, struct fragmentInfo* fragmentInfo, unsigned int tcpBaseSeq, unsigned char* packet, unsigned short packetLen,
     unsigned char* host_addr, unsigned short host_len, struct fragmentationParams* params, unsigned short* pprogress) {
     //printf("initializing fragmenter\n");
@@ -1084,7 +1083,10 @@ void do_fragmentation(HANDLE filter, WINDIVERT_ADDRESS* pAddr, struct fragmentIn
                     connections[i].taken = 0;
                     break;
                 }
+        #ifdef SYNNER_NAG
         if (mss == 1200) printf("ERROR: CONNECTION TRACKING FAIL\n");
+        else if (mss == 0) printf("UH OH!\n");
+        #endif
         target_fragment_size = mss;
     }
     else if (params->tls_absolute_frag_size == 0 && params->mode == 1) target_fragment_size = 500; //Failsafe.
@@ -1658,6 +1660,8 @@ void* do_conntrack(void* something) {
     else printf("conntrack init error %u\n", GetLastError());
 }
 
+char host_addrBACK[HOST_MAXLEN];
+unsigned short host_lenBACK;
 int seq_offset = 0;
 
 void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct superReverseParams* params, struct fragmentInfo* fragmentInfo, unsigned char* host_addr, unsigned int host_len, unsigned char* srcPacket, unsigned int srcPacketLen, unsigned int tcpBaseSeq, unsigned short baseid, unsigned char* fakepacket, unsigned short fakepacketlen) {
@@ -1691,7 +1695,10 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
                 //printf("Un-Match %u.%u.%u.%u %up%ue\n", PTRTOIP(&connections[i].ip), ptrtouice(fakePacket + hdrLen + 4), connections[i].seq);
             }
         }
+    #ifdef SYNNER_NAG
     if (mss == 1200) printf("ERROR: CONNECTION TRACKING FAIL\n");
+    else if (mss == 0) printf("UH OH!\n");
+    #endif
     //printf("starting...\n");
     //printf("Begin Super Reverse\n");
     if (mode != 3 && fakepacket != NULL && fakepacketlen > 0) {
@@ -1984,6 +1991,30 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
                 else {
                     setptrtousce(srcPacket + 4, baseid++);
                 }
+                if (fakebuildlen[2] > 0 && fakepacket != NULL) { //SEND MODE 2 FAKES
+                    struct fragmentInfo tempinfo;
+                    for (unsigned int i = 0; i < fakebuildlen[2]; i++) {
+                        struct fakebuild* poi = &(fakebuilds[2][i]);
+                        tempinfo.length = 0;
+                        unsigned char* selpacket = poi->type ? fakepacket : fakePacket;
+                        unsigned short selpacketlen = poi->type ? fakepacketlen : srcPacketLen;
+                        selpacket[8] = poi->ttl > 0 ? poi->ttl : srcPacket[8];
+                        struct fragmentationParams fparams = {
+                            .mode = poi->fragmentation,
+                            .write_fragments = poi->disorder > 0,
+                            .badchksum = poi->chksum,
+                            .tls_absolute_frag_size = params->tls_absolute_frag_size,
+                        };
+                        struct superReverseParams sparams = {
+                            .flags = 0b1000000 | poi->disorder == 2 ? 0b10 : 0,
+                        };
+                        if (poi->badseq == 0) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq);
+                        else if (poi->badseq == 1) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq + seq_offset);
+                        else if (poi->badseq == 2) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq - selpacketlen - hdrLen - dataOffset);
+                        do_fragmentation(filter, pAddr, &tempinfo, 0, selpacket, selpacketlen, NULL, 0, &fparams, NULL);
+                        if (poi->disorder > 0) do_super_reverse_frag(filter, pAddr, &sparams, &tempinfo, NULL, 0, selpacket, 0, ptrtouice(selpacket + hdrLen + 4), 0, NULL, 0);
+                    }
+                }
                 if (!badchksum)
                 WinDivertHelperCalcChecksums(
                     fragmentHolder, totalLength, pAddr, 0
@@ -1993,6 +2024,30 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
                     totalLength,
                     NULL, pAddr
                 );
+                if (fakebuildlen[3] > 0 && fakepacket != NULL) { //SEND MODE 2 FAKES
+                    struct fragmentInfo tempinfo;
+                    for (unsigned int i = 0; i < fakebuildlen[3]; i++) {
+                        struct fakebuild* poi = &(fakebuilds[3][i]);
+                        tempinfo.length = 0;
+                        unsigned char* selpacket = poi->type ? fakepacket : fakePacket;
+                        unsigned short selpacketlen = poi->type ? fakepacketlen : srcPacketLen;
+                        selpacket[8] = poi->ttl > 0 ? poi->ttl : srcPacket[8];
+                        struct fragmentationParams fparams = {
+                            .mode = poi->fragmentation,
+                            .write_fragments = poi->disorder > 0,
+                            .badchksum = poi->chksum,
+                            .tls_absolute_frag_size = params->tls_absolute_frag_size,
+                        };
+                        struct superReverseParams sparams = {
+                            .flags = 0b1000000 | poi->disorder == 2 ? 0b10 : 0,
+                        };
+                        if (poi->badseq == 0) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq);
+                        else if (poi->badseq == 1) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq + seq_offset);
+                        else if (poi->badseq == 2) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq - selpacketlen - hdrLen - dataOffset);
+                        do_fragmentation(filter, pAddr, &tempinfo, 0, selpacket, selpacketlen, NULL, 0, &fparams, NULL);
+                        if (poi->disorder > 0) do_super_reverse_frag(filter, pAddr, &sparams, &tempinfo, NULL, 0, selpacket, 0, ptrtouice(selpacket + hdrLen + 4), 0, NULL, 0);
+                    }
+                }
             }
             //differentiate(reassembleSegments, ntohs(ptrtous(srcPacket + 2)) - dataOffset - hdrLen, srcPacket + hdrLen + dataOffset, ntohs(ptrtous(srcPacket + 2)) - hdrLen - dataOffset, 0);
             //if (!istlshandshake(reassembleSegments)) printf("What?\n");
@@ -3066,8 +3121,10 @@ int main(int argc, char *argv[]) {
                                     //printf("Un-Match %u.%u.%u.%u %up%ue\n", PTRTOIP(&connections[i].ip), ptrtouice(fakePacket + hdrLen + 4), connections[i].seq);
                                 }
                             }
+                            #ifdef SYNNER_NAG
                             if (mss == 1200) printf("ERROR: CONNECTION TRACKING FAIL\n");
                             else if (mss == 0) printf("UH OH!\n");
+                            #endif
                             SAFE_SEND(w_filter, &addr, packet, packetLen, mss);
                             should_reinject = 0;
                             }
@@ -3104,8 +3161,10 @@ int main(int argc, char *argv[]) {
                                     //printf("Un-Match %u.%u.%u.%u %up%ue\n", PTRTOIP(&connections[i].ip), ptrtouice(fakePacket + hdrLen + 4), connections[i].seq);
                                 }
                             }
+                            #ifdef SYNNER_NAG
                             if (mss == 1200) printf("ERROR: CONNECTION TRACKING FAIL\n");
                             else if (mss == 0) printf("UH OH!\n");
+                            #endif
                             printf("DAMN. (");
                             xprint(host_addr, host_len, 0);
                             printf(")\n");
