@@ -285,7 +285,9 @@ static struct option long_options[] = {
     {"fake-randgen",required_argument, 0,  'Y' },
     {"fake-override",required_argument,0,  'X' },
     {"seq-offset",  required_argument, 0,  'I' },
+    {"extension-frag",required_argument,0, 'Q' }, //65535:8
     {"set-seed",    required_argument, 0,  'M' },
+    {"manual-fake", required_argument, 0,  'W' }, //Override modern fake packet generation.
     {0,             0,                 0,   0  }
 };
 
@@ -1025,16 +1027,18 @@ struct superReverseParams {
     unsigned short https_fragment_size;
     unsigned short tls_recseg_size; //Damn it.
     unsigned short tls_absolute_frag_size;
+    unsigned char nfragments;
     unsigned char flags;
 };
-struct fakebuild {
+struct fakebuild { //Finally, perfect alignment.
     unsigned char mode; //Functions identically to fakemode, except 0 is 1 and so on, since real 0 makes no sense.
-    unsigned char type; //0 = Packet filled with zeroes; 1 = Fake with fakemap SNI
-    unsigned char fragmentation; //0 = No fragmentation; 1 = Absolute Fragmentation; 2 = Random Fragmentation
-    unsigned char disorder; //0 = Native; 1 = Reverse; 2 = RPLRR
-    unsigned char ttl; //0 = Unchanged TTL; >0 = Set TTL
-    unsigned char chksum; //0 = OK Checksums; 1 = Bad TCP Checksum;
-    unsigned char badseq; //0 = Unshifted SEQ; 1 = SEQ 100 bytes in the past;
+    unsigned char type; //0 = Packet filled with zeroes; 1 = Fake with fakemap SNI.
+    unsigned char fragmentation; //0 = No fragmentation; 1 = Absolute Fragmentation; 2 = Random Fragmentation.
+    unsigned char disorder; //0 = Native; 1 = Reverse; 2 = RPLRR.
+    unsigned char ttl; //0 = Unchanged TTL; >0 = Set TTL.
+    unsigned char chksum; //0 = OK Checksums; 1 = Bad TCP Checksum.
+    unsigned char badseq; //0 = Unshifted SEQ; 1 = SEQ 100 bytes in the past.
+    unsigned char nfragments; //0 = Send all fragments; >0 = Send only n fragments.
 };
 unsigned char overriden = 0;
 struct fakebuild *fakebuilds[4],
@@ -1053,25 +1057,43 @@ void add_fragment(unsigned char* packet, struct fragmentInfo* fragmentInfo) {
     fragmentInfo->fragments[fragmentInfo->length].payloadLen = ptrtousce(packet + 2) - hdrLen - dataOffset;
     fragmentInfo->length++;
 }
+unsigned char hextou8(unsigned char in) {
+    return (in >= '0' && in <= '9') ? in - '0' : (in >= 'A' && in <= 'F') ? in - 'A' + 10 : (in >= 'a' && in <= 'f') ? in - 'a' + 10 : 0;
+}
+struct extfragparam {
+    unsigned short type;
+    unsigned short fragsize;
+};
+struct extfraginfo {
+    unsigned short offset;
+    unsigned short length;
+    unsigned short fragsize;
+};
 struct fragmentationParams {
     unsigned char mode; //0 = No fragmentation other than to the SNI! (IF THERE EVEN IS ONE!); 1 = Absolute fragmentation; 2 = Random Fragmentation; 3 = Smart fragmentation;
     unsigned char write_fragments; //To support super reverse fragmentation.
     unsigned char allow_sni_overlap;
     unsigned char cleave_sni;
     unsigned char badchksum;
+    unsigned char nfragments;
     unsigned short sni_fragment_size;
     unsigned short tls_absolute_frag_size;
     unsigned short ext_frag_size;
     unsigned short compound_frag; // >0 = Compound fragmentation enabled.
+    unsigned short extfragparamlen;
+    struct extfragparam* extfragparams;
 };
 void do_fragmentation(HANDLE filter, WINDIVERT_ADDRESS* pAddr, struct fragmentInfo* fragmentInfo, unsigned int tcpBaseSeq, unsigned char* packet, unsigned short packetLen,
     unsigned char* host_addr, unsigned short host_len, struct fragmentationParams* params, unsigned short* pprogress) {
     //printf("initializing fragmenter\n");
-    unsigned short progress = 0, current_fragment_size = 0, totalLength = 0, target_fragment_size = (params->tls_absolute_frag_size > 0 && params->mode == 1) ? params->tls_absolute_frag_size : 0,
-                   sni_fragment_size = params->sni_fragment_size, ext_frag_size = params->ext_frag_size, ciphersuitelen = 0, compound_frag = params->compound_frag, extensionLen = 0, extensionType = 0;
+    unsigned short progress = 0, current_fragment_size = 0, totalLength = 0, target_fragment_size = (params->tls_absolute_frag_size > 0 && (params->mode == 1 || params->mode == 4)) ? params->tls_absolute_frag_size : 0,
+                   sni_fragment_size = params->sni_fragment_size, ext_frag_size = params->ext_frag_size, ciphersuitelen = 0, compound_frag = params->compound_frag, extensionLen = 0, extensionType = 0,
+                   parseprogress = 0, elementcount = 0, elementprogress = 0, extfragparamlen = params->extfragparamlen;
     unsigned char super_reverse = (params->write_fragments && fragmentInfo != NULL), fragmentHolder[65535], hdrLen = (packet[0] & 0x0F) * 4, dataOffset = (packet[hdrLen + 12] >> 4) * 4,
                   sni_ok = (host_len != 0 && host_addr != NULL), fragging_sni = 0, allow_sni_overlap = params->allow_sni_overlap, cleave_sni = params->cleave_sni,
-                  session_len = 0, compresslen = 0, badchksum = params->badchksum;
+                  session_len = 0, compresslen = 0, badchksum = params->badchksum, sentfragments = 0, nfragments = params->nfragments, skipcycle = 0;
+    struct extfraginfo *extfraginfo = NULL, *selextfraginfo = NULL;
+    struct extfragparam* extfragparams = params->extfragparams;
     //printf("initialized variables\n");
     if (params->tls_absolute_frag_size == 0 && params->mode == 0) {
         unsigned short mss = 1200;
@@ -1111,6 +1133,7 @@ void do_fragmentation(HANDLE filter, WINDIVERT_ADDRESS* pAddr, struct fragmentIn
                 totalLength,
                 NULL, pAddr
             );
+            if (nfragments != 0 && ++sentfragments >= nfragments) return;
         }
         else
             add_fragment(fragmentHolder, fragmentInfo);
@@ -1118,12 +1141,84 @@ void do_fragmentation(HANDLE filter, WINDIVERT_ADDRESS* pAddr, struct fragmentIn
     }
     //printf("processed compound fragmentation\n");
     if (sni_ok) {
-        session_len = packet[hdrLen + dataOffset + 43], compresslen = packet[hdrLen + dataOffset + 46 + session_len + ciphersuitelen];
-        ciphersuitelen = ptrtousce(packet + hdrLen + dataOffset + 44 + session_len);
+        session_len = packet[hdrLen + dataOffset + 43], ciphersuitelen = ptrtousce(packet + hdrLen + dataOffset + 44 + session_len),
+        compresslen = packet[hdrLen + dataOffset + 46 + session_len + ciphersuitelen];
     }
     if ((!sni_ok || progress > 12) && params->mode == 3) params->mode = 0;
     //printf("processed SNI\n");
     switch (params->mode) {
+        case 4: //Extension based fragmentation.
+            parseprogress = 49 + session_len + ciphersuitelen + compresslen;
+            while (parseprogress < packetLen - hdrLen - dataOffset) {//Parse extensions.
+                for (unsigned short i = 0; i < extfragparamlen; i++)
+                    if (extfragparams[i].type == ptrtousce(packet + hdrLen + dataOffset + parseprogress)) elementcount++;
+                parseprogress += ptrtousce(packet + hdrLen + dataOffset + parseprogress + 2) + 4;
+            }
+            if (elementcount > 0) {
+                parseprogress = 49 + session_len + ciphersuitelen + compresslen;
+                extfraginfo = malloc(sizeof(struct extfraginfo) * elementcount);
+                while (parseprogress < packetLen - hdrLen - dataOffset) {//Now do it again, but actually start doing something useful.
+                    for (unsigned short i = 0; i < extfragparamlen; i++)
+                        if (extfragparams[i].type == ptrtousce(packet + hdrLen + dataOffset + parseprogress)) {
+                            extfraginfo[elementprogress].offset = parseprogress;
+                            extfraginfo[elementprogress].length = ptrtousce(packet + hdrLen + dataOffset + parseprogress + 2) + 4;
+                            extfraginfo[elementprogress++].fragsize = extfragparams[i].fragsize;
+                        }
+                    parseprogress += ptrtousce(packet + hdrLen + dataOffset + parseprogress + 2) + 4;
+                }
+                unsigned short extfragsize = 0;
+                while (progress != packetLen - hdrLen - dataOffset) {
+                    //printf("AF progress: %u\n", progress);
+                    skipcycle = 0;
+                    current_fragment_size = extfragsize == 0 ? target_fragment_size : ext_frag_size;
+                    //printf("TFS: %u\n", target_fragment_size);
+                    //printf("CFS: %u\n", current_fragment_size);
+                    if (selextfraginfo == NULL) {
+                        for (unsigned short i = 0; i < elementcount; i++) {
+                            if (extfraginfo[i].length == 0) continue;
+                            if (!(hdrLen + dataOffset + progress >= extfraginfo[i].offset + extfraginfo[i].length) && hdrLen + dataOffset + progress + current_fragment_size >= extfraginfo[i].offset) { //Dangerously close to extension, fragment right before it
+                                extfragsize = extfragparams[i].fragsize;
+                                selextfraginfo = &(extfraginfo[i]);
+                                current_fragment_size = (unsigned int) (extfraginfo[i].offset - dataOffset - hdrLen - progress);
+                                if (current_fragment_size == 0) skipcycle = 1;
+                                break;
+                            }
+                        }
+                        if (skipcycle) continue;
+                    }
+                    else if (hdrLen + dataOffset + progress + current_fragment_size >= selextfraginfo->offset + selextfraginfo->length) { //Exitting extension, fragment until the end of the extension.
+                        current_fragment_size = (unsigned int) (selextfraginfo->offset + selextfraginfo->length - hdrLen - dataOffset - progress);
+                        extfragsize = 0;
+                        selextfraginfo->length = 0; //Make extension invalid, as it has already been processed.
+                        selextfraginfo = NULL;
+                        if (current_fragment_size == 0) continue;
+                    }
+                    if (hdrLen + dataOffset + progress + current_fragment_size >= packetLen) { //Uh oh.
+                        current_fragment_size = packetLen - hdrLen - dataOffset - progress;
+                        if (current_fragment_size == 0) break;
+                    }
+                    memcpy(fragmentHolder + hdrLen + dataOffset, packet + hdrLen + dataOffset + progress, current_fragment_size);
+                    totalLength = hdrLen + dataOffset + current_fragment_size;
+                    setptrtousce(fragmentHolder + 2, totalLength);
+                    setptrtouice(fragmentHolder + hdrLen + 4, tcpBaseSeq + progress);
+                    NEWPACKETID(fragmentHolder);
+                    if (!super_reverse) {
+                        if (!badchksum)
+                        WinDivertHelperCalcChecksums(
+                            fragmentHolder, totalLength, pAddr, 0
+                        );
+                        WinDivertSend(
+                            filter, fragmentHolder,
+                            totalLength,
+                            NULL, pAddr
+                        );
+                        if (nfragments != 0 && ++sentfragments >= nfragments) return;
+                    }
+                    else add_fragment(fragmentHolder, fragmentInfo);
+                    progress += current_fragment_size;
+                }
+                free(extfraginfo);
+            }
         case 3: //This is gonna zuck.
             while (progress < 12) { //Improved interoperability.
                 current_fragment_size = 2;
@@ -1357,6 +1452,7 @@ void do_fragmentation(HANDLE filter, WINDIVERT_ADDRESS* pAddr, struct fragmentIn
                         totalLength,
                         NULL, pAddr
                     );
+                    if (nfragments != 0 && ++sentfragments >= nfragments) return;
                 }
                 else add_fragment(fragmentHolder, fragmentInfo);
                 progress += current_fragment_size;
@@ -1404,6 +1500,7 @@ void do_fragmentation(HANDLE filter, WINDIVERT_ADDRESS* pAddr, struct fragmentIn
                         totalLength,
                         NULL, pAddr
                     );
+                    if (nfragments != 0 && ++sentfragments >= nfragments) return;
                 }
                 else add_fragment(fragmentHolder, fragmentInfo);
                 progress += current_fragment_size;
@@ -1415,11 +1512,11 @@ void do_fragmentation(HANDLE filter, WINDIVERT_ADDRESS* pAddr, struct fragmentIn
     if (pprogress != NULL) *pprogress = progress;
     //printf("returning\n");
 }
-#define SAFE_SEND(filter, pAddr, packet, packetLen, mss)\
-    struct fragmentationParams sparams = {1};\
-    sparams.tls_absolute_frag_size = mss;\
-    do_fragmentation(filter, pAddr, NULL, 0, packet, packetLen, NULL, 0, &sparams, NULL);
-
+void safe_send(HANDLE filter, WINDIVERT_ADDRESS* pAddr, unsigned char *packet, unsigned int packetLen, unsigned short mss) {
+    struct fragmentationParams params = {1};
+    params.tls_absolute_frag_size = mss;
+    do_fragmentation(filter, pAddr, NULL, 0, packet, packetLen, NULL, 0, &params, NULL);
+}
 void xorinate(char* victim, unsigned int victimLen, char* key, unsigned int keyLen) 
 {
     for (unsigned int vicPtr = 0; vicPtr < victimLen; vicPtr++) { //Very clever!
@@ -1671,7 +1768,7 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
                   fragmentHolder[MAX_PACKET_SIZE], recordbufferpacket[65535], *recordbuffer, fakePacket[65535], fakehost[256],
                   tls_force_native = 0, rplrr_by_sni = 0,
                   vortex_frag = 0, vortex_frag_by_sni = 0, rplrr = 0,
-                  record_frag = 0, mode = 0, badchksum = 0;
+                  record_frag = 0, mode = 0, badchksum = 0, sentfragments = 0, nfragments = 0;
     unsigned short totalLength, vortex_left, vortex_right, vortex_step, vortex_direction, vortex_relevant, mss = 1200, fragmentInfoLen = fragmentInfo->length,
                    vortex_step_left = 0, vortex_step_right = 0, https_fragment_size = 0,
                    beginSni = fragmentInfo->beginSni, endSni = fragmentInfo->endSni;
@@ -1682,6 +1779,7 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
         vortex_frag = (params->flags & 0b1000) > 0; vortex_frag_by_sni = (params->flags & 0b100) > 0; rplrr = (params->flags & 0b10) > 0;
         record_frag = params->flags & 1; mode = (record_frag ? 3 : vortex_frag ? 1 : rplrr ? 2 : 0); //BITWISE MADNESS
         vortex_step_left = params->vortex_step_left; vortex_step_right = params->vortex_step_right; https_fragment_size = params->https_fragment_size;
+        nfragments = params->nfragments;
     }
     for (unsigned short i = 0; i < connectionslen; i++)
         if (connections[i].taken && connections[i].ip == *((unsigned int*)(srcPacket + 16))) {
@@ -1708,6 +1806,7 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             fakePacket[i] = 0;
         
         if (fakebuildlen[0] > 0) { //SEND MODE 0 FAKES
+            printf("sending mode 0 fakes\n");
             struct fragmentInfo tempinfo;
             for (unsigned int i = 0; i < fakebuildlen[0]; i++) {
                 struct fakebuild* poi = &(fakebuilds[0][i]);
@@ -1720,15 +1819,18 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
                     .write_fragments = poi->disorder > 0,
                     .badchksum = poi->chksum,
                     .tls_absolute_frag_size = params->tls_absolute_frag_size,
-                };
-                struct superReverseParams sparams = {
-                    .flags = 0b1000000 | poi->disorder == 2 ? 0b10 : 0,
+                    .nfragments = poi->disorder > 0 ? 0 : poi->nfragments,
                 };
                 if (poi->badseq == 0) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq);
                 else if (poi->badseq == 1) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq + seq_offset);
                 else if (poi->badseq == 2) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq - selpacketlen - hdrLen - dataOffset);
                 do_fragmentation(filter, pAddr, &tempinfo, 0, selpacket, selpacketlen, NULL, 0, &fparams, NULL);
-                if (poi->disorder > 0) do_super_reverse_frag(filter, pAddr, &sparams, &tempinfo, NULL, 0, selpacket, 0, ptrtouice(selpacket + hdrLen + 4), 0, NULL, 0);
+                if (poi->disorder > 0) {
+                    struct superReverseParams sparams = {
+                        .flags = 0b1000000 | poi->disorder == 2 ? 0b10 : 0, .nfragments = poi->nfragments,
+                    };
+                    do_super_reverse_frag(filter, pAddr, &sparams, &tempinfo, NULL, 0, selpacket, 0, ptrtouice(selpacket + hdrLen + 4), 0, NULL, 0);
+                }
             }
         }
     }
@@ -1770,6 +1872,7 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
                     totalLength,
                     NULL, pAddr
                 );
+                if (nfragments != 0 && ++sentfragments >= nfragments) return;
                 if (vortex_direction == 0) vortex_left++;
                 else vortex_right--;
                 vortex_step++;
@@ -1815,6 +1918,7 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
                     totalLength,
                     NULL, pAddr
                 );
+                if (nfragments != 0 && ++sentfragments >= nfragments) return;
                 if (i == 0) {
                     vortex_left++;
                     goto skipCondLeft;
@@ -1936,7 +2040,7 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             memcpy(fragmentHolder, srcPacket, hdrLen + dataOffset);
             fragmentInfo->length = 0;
             //printf("fakemap check\n");
-            if (blackwhitelist_check_hostname(host_addrBACK, host_lenBACK, 3, fakehost)) {
+            if (blackwhitelist_check_hostname(host_addrBACK, host_lenBACK, 3, fakehost) && fakepacket == NULL) {
                 printf("MATCH! (%s)\n", fakehost);
                 struct clienthello clienthello;
                 char foundpadding = 0;
@@ -1974,8 +2078,8 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             conntrack[freeWaiting].nextpacketid = ptrtousce(srcPacket + 4) + fragmentInfo->length;
             //printf("Sending %u fragments.\n", fragmentInfo->length);
             if (!tls_force_native) {
-                //printf("attempting to start super reverse in record fragmentation\n");
-                do_super_reverse_frag(filter, pAddr, &srparams, fragmentInfo, NULL, 0, recordbufferpacket, tls_len + hdrLen + dataOffset, tcpBaseSeq, 0, fakePacket, fakePacketLen);
+                //printf("%p, %u\n", fakepacket, fakepacketlen);
+                do_super_reverse_frag(filter, pAddr, &srparams, fragmentInfo, NULL, 0, recordbufferpacket, tls_len + hdrLen + dataOffset, tcpBaseSeq, 0, fakepacket == NULL ? fakePacket : fakepacket, fakepacket == NULL ? fakePacketLen : fakepacketlen);
             }
             //printf("over\n");
             break;
@@ -1984,36 +2088,36 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             for (short i = fragmentInfoLen - 1; i >= 0; i--) {
                 tcpSeq = fragments[i].seq;
                 totalLength = hdrLen + dataOffset + fragments[i].payloadLen;
+                if (fakebuildlen[2] > 0 && fakepacket != NULL) { //SEND MODE 2 FAKES
+                    for (unsigned int i = 0; i < fakebuildlen[2]; i++) {
+                        struct fakebuild* poi = &(fakebuilds[2][i]);
+                        unsigned char* selpacket = poi->type ? fakepacket : fakePacket;
+                        unsigned short selpacketlen = poi->type ? fakepacketlen : srcPacketLen;
+                        fragmentHolder[8] = poi->ttl > 0 ? poi->ttl : srcPacket[8];
+                        if (poi->badseq == 0) setptrtouice(fragmentHolder + hdrLen + 4, tcpSeq);
+                        else if (poi->badseq == 1) setptrtouice(fragmentHolder + hdrLen + 4, tcpSeq + seq_offset);
+                        else if (poi->badseq == 2) setptrtouice(fragmentHolder + hdrLen + 4, tcpBaseSeq - selpacketlen - hdrLen - dataOffset); //Not changed.
+                        NEWPACKETID(fragmentHolder);
+                        setptrtousce(fragmentHolder + 2, totalLength);
+                        memcpy(fragmentHolder + hdrLen + dataOffset, selpacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset);
+                        if (!poi->chksum)
+                            WinDivertHelperCalcChecksums(
+                            fragmentHolder, totalLength, pAddr, 0
+                        );
+                        WinDivertSend(
+                            filter, fragmentHolder,
+                            totalLength,
+                            NULL, pAddr
+                        );
+                    }
+                    memcpy(fragmentHolder, srcPacket, hdrLen + dataOffset); //Restore headers
+                }
                 setptrtouice(fragmentHolder + hdrLen + 4, tcpSeq);
                 setptrtousce(fragmentHolder + 2, totalLength);
                 memcpy(fragmentHolder + hdrLen + dataOffset, srcPacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset);
                 if (!baseid) NEWPACKETID(fragmentHolder);
                 else {
                     setptrtousce(srcPacket + 4, baseid++);
-                }
-                if (fakebuildlen[2] > 0 && fakepacket != NULL) { //SEND MODE 2 FAKES
-                    struct fragmentInfo tempinfo;
-                    for (unsigned int i = 0; i < fakebuildlen[2]; i++) {
-                        struct fakebuild* poi = &(fakebuilds[2][i]);
-                        tempinfo.length = 0;
-                        unsigned char* selpacket = poi->type ? fakepacket : fakePacket;
-                        unsigned short selpacketlen = poi->type ? fakepacketlen : srcPacketLen;
-                        selpacket[8] = poi->ttl > 0 ? poi->ttl : srcPacket[8];
-                        struct fragmentationParams fparams = {
-                            .mode = poi->fragmentation,
-                            .write_fragments = poi->disorder > 0,
-                            .badchksum = poi->chksum,
-                            .tls_absolute_frag_size = params->tls_absolute_frag_size,
-                        };
-                        struct superReverseParams sparams = {
-                            .flags = 0b1000000 | poi->disorder == 2 ? 0b10 : 0,
-                        };
-                        if (poi->badseq == 0) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq);
-                        else if (poi->badseq == 1) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq + seq_offset);
-                        else if (poi->badseq == 2) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq - selpacketlen - hdrLen - dataOffset);
-                        do_fragmentation(filter, pAddr, &tempinfo, 0, selpacket, selpacketlen, NULL, 0, &fparams, NULL);
-                        if (poi->disorder > 0) do_super_reverse_frag(filter, pAddr, &sparams, &tempinfo, NULL, 0, selpacket, 0, ptrtouice(selpacket + hdrLen + 4), 0, NULL, 0);
-                    }
                 }
                 if (!badchksum)
                 WinDivertHelperCalcChecksums(
@@ -2024,29 +2128,32 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
                     totalLength,
                     NULL, pAddr
                 );
-                if (fakebuildlen[3] > 0 && fakepacket != NULL) { //SEND MODE 2 FAKES
+                if (nfragments != 0 && ++sentfragments >= nfragments) return;
+                if (fakebuildlen[3] > 0 && fakepacket != NULL) { //SEND MODE 3 FAKES
                     struct fragmentInfo tempinfo;
                     for (unsigned int i = 0; i < fakebuildlen[3]; i++) {
                         struct fakebuild* poi = &(fakebuilds[3][i]);
                         tempinfo.length = 0;
                         unsigned char* selpacket = poi->type ? fakepacket : fakePacket;
                         unsigned short selpacketlen = poi->type ? fakepacketlen : srcPacketLen;
-                        selpacket[8] = poi->ttl > 0 ? poi->ttl : srcPacket[8];
-                        struct fragmentationParams fparams = {
-                            .mode = poi->fragmentation,
-                            .write_fragments = poi->disorder > 0,
-                            .badchksum = poi->chksum,
-                            .tls_absolute_frag_size = params->tls_absolute_frag_size,
-                        };
-                        struct superReverseParams sparams = {
-                            .flags = 0b1000000 | poi->disorder == 2 ? 0b10 : 0,
-                        };
-                        if (poi->badseq == 0) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq);
-                        else if (poi->badseq == 1) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq + seq_offset);
-                        else if (poi->badseq == 2) setptrtouice(selpacket + hdrLen + 4, tcpBaseSeq - selpacketlen - hdrLen - dataOffset);
-                        do_fragmentation(filter, pAddr, &tempinfo, 0, selpacket, selpacketlen, NULL, 0, &fparams, NULL);
-                        if (poi->disorder > 0) do_super_reverse_frag(filter, pAddr, &sparams, &tempinfo, NULL, 0, selpacket, 0, ptrtouice(selpacket + hdrLen + 4), 0, NULL, 0);
+                        fragmentHolder[8] = poi->ttl > 0 ? poi->ttl : srcPacket[8];
+                        if (poi->badseq == 0) setptrtouice(fragmentHolder + hdrLen + 4, tcpSeq);
+                        else if (poi->badseq == 1) setptrtouice(fragmentHolder + hdrLen + 4, tcpSeq + seq_offset);
+                        else if (poi->badseq == 2) setptrtouice(fragmentHolder + hdrLen + 4, tcpBaseSeq - selpacketlen - hdrLen - dataOffset); //Not changed.
+                        NEWPACKETID(fragmentHolder);
+                        setptrtousce(fragmentHolder + 2, totalLength);
+                        memcpy(fragmentHolder + hdrLen + dataOffset, selpacket + hdrLen + dataOffset + (tcpSeq - tcpBaseSeq), totalLength - hdrLen - dataOffset);
+                        if (!poi->chksum)
+                            WinDivertHelperCalcChecksums(
+                            fragmentHolder, totalLength, pAddr, 0
+                        );
+                        WinDivertSend(
+                            filter, fragmentHolder,
+                            totalLength,
+                            NULL, pAddr
+                        );
                     }
+                    memcpy(fragmentHolder, srcPacket, hdrLen + dataOffset); //Restore headers
                 }
             }
             //differentiate(reassembleSegments, ntohs(ptrtous(srcPacket + 2)) - dataOffset - hdrLen, srcPacket + hdrLen + dataOffset, ntohs(ptrtous(srcPacket + 2)) - hdrLen - dataOffset, 0);
@@ -2106,7 +2213,9 @@ int main(int argc, char *argv[]) {
                   *packet = NULL,
                   recordbufferpacket[65535], //The giant enemy records.
                   *recordbuffer,
-                  *packet_data;
+                  *packet_data,
+                  *manualfake = NULL,
+                  manualfakepacket[MAX_PACKET_SIZE * 2];
     UINT packet_dataLen, packetLen;
     PWINDIVERT_IPHDR ppIpHdr;
     PWINDIVERT_IPV6HDR ppIpV6Hdr;
@@ -2138,7 +2247,7 @@ int main(int argc, char *argv[]) {
         vortex_frag = 0, vortex_frag_by_sni = 0, vortex_step_left = 1, vortex_step_right = 1; //"Big boy words" my- it's gone...
     unsigned int http_fragment_size = 0, https_fragment_size = 0, sni_fragment_size = 0, ext_frag_size = 0, tls_absolute_frag = 0, tls_recseg_size = 0,
                  current_fragment_size = 0, host_len, useragent_len, tcpBaseSeq = 0;
-    unsigned short max_payload_size = 0, cleave_sni = 0, fakePacketLen = 0, progress = 0;
+    unsigned short max_payload_size = 0, cleave_sni = 0, fakePacketLen = 0, progress = 0, progress2 = 0, manualfakelen = 0;
     short host_shiftback = 0;
     BYTE should_send_fake = 0;
     BYTE ttl_of_fake_packet = 0;
@@ -2151,7 +2260,7 @@ int main(int argc, char *argv[]) {
     struct in6_addr dns_temp_addr = {0};
     uint16_t dnsv4_port = htons(53);
     uint16_t dnsv6_port = htons(53);
-    unsigned char *host_addr, *useragent_addr, *method_addr, hdrLen, dataOffset;
+    unsigned char *host_addr, *useragent_addr, *method_addr, hdrLen, dataOffset, doable = 0;
     int http_req_fragmented;
     char *hdr_name_addr = NULL, *hdr_value_addr = NULL;
     unsigned int hdr_value_len;
@@ -2202,9 +2311,9 @@ int main(int argc, char *argv[]) {
         do_block_quic = 1;
         max_payload_size = 1200;
     }
-    struct fakebuild fakebuild;
-    unsigned char step = 0, ttlholdstep = 0;
-    char ttlhold[4] = "0\0";
+    struct fakebuild fakebuild = {0};
+    unsigned char step = 0, u8holdstep = 0;
+    char u8hold[4] = "0\0";
     unsigned int max = strlen(optarg);
 
     while ((opt = getopt_long(argc, argv, "123456789pqrsafy:e:mwk:n", long_options, NULL)) != -1) {
@@ -2314,6 +2423,7 @@ int main(int argc, char *argv[]) {
                     fakebuild.ttl = genrand16(randseed) % 256;
                     fakebuild.chksum = genrand16(randseed) % 2;
                     fakebuild.badseq = genrand16(randseed) % 3;
+                    fakebuild.nfragments = genrand16(randseed) % 16;
                     printf("MODE: %u TYPE %u FRAGMODE %u DISORDERING %u TTL %u CHECKSUM %u, BADSEQ %u\n", fakebuild.mode, fakebuild.type, fakebuild.fragmentation, fakebuild.disorder, fakebuild.ttl, fakebuild.chksum);
                     void* tempptr = realloc(fakebuilds[fakebuild.mode], ++fakebuildlen[fakebuild.mode] * sizeof(struct fakebuild)); //Sucks, but that's too bad.
                     if (tempptr == NULL) {
@@ -2325,7 +2435,7 @@ int main(int argc, char *argv[]) {
                 }
                 break;
             case 'C': // --tls-recseg-size
-                tls_recseg_size = atousi(optarg, "Fragment size should be in range [0 - 65535]\n");
+                tls_recseg_size = atousi(optarg, "(RECSEG) Fragment size should be in range [0 - 65535]\n");
                 break;
             case '-': // --discord-vc
                 const char *tcp = " or (outbound and tcp and !impostor and !loopback " MAXPAYLOADSIZE_TEMPLATE " and " \
@@ -2369,31 +2479,55 @@ int main(int argc, char *argv[]) {
                 mss = atousi(optarg, "MSS should be in range [0 - 65535]\n");
                 synning = 1;
                 break;
+            case 'W':
+                max = strlen(optarg);
+                if (manualfake == NULL && max % 2 == 0) {
+                    manualfake = malloc(MAX_PACKET_SIZE * 2);
+                    if (manualfake == 0) {
+                        printf("Out of memory! What?\n");
+                        die();
+                    }
+                    progress = 0;
+                    progress2 = 0;
+                    while (progress < max) {
+                        manualfake[progress2++] = hextou8(optarg[progress++]) * 16 + hextou8(optarg[progress++]);
+                    }
+                    manualfakelen = progress2;
+                }
+                else if (manualfake == NULL) printf("An EVEN amount of characters must be used to manually create a fake packet.\n");
+                else printf("Can't overwrite fake packet.\n");
+                break;
             case 'f':
                 do_fragment_http = 1;
-                SET_HTTP_FRAGMENT_SIZE_OPTION(atousi(optarg, "Fragment size should be in range [0 - 0xFFFF]\n"));
+                SET_HTTP_FRAGMENT_SIZE_OPTION(atousi(optarg, "(HTTP) Fragment size should be in range [0 - 0xFFFF]\n"));
                 break;
             case 'F':
                 step = 0;
                 progress = 0;
                 max = strlen(optarg);
-                ttlholdstep = 0;
-                while (progress < max && step < 7) {
+                u8holdstep = 0;
+                while (progress < max && step < 8) {
                     unsigned char curchar = optarg[progress++];
-                    if (step != 4 && curchar >= '0' && curchar <= '9')
+                    if (step != 4 && step != 7 && curchar >= '0' && curchar <= '9')
                         ((unsigned char*)&fakebuild)[step++] = curchar - '0';
-                    else if (step == 4) {
-                        if (curchar == '0' && ttlholdstep == 0)
+                    else if (step == 4 || step == 7) {
+                        if (curchar == '0' && u8holdstep == 0)
                             ((unsigned char*)&fakebuild)[step++] = 0;
-                        if (curchar >= '0' && curchar <= '9' && ttlholdstep < 3)
-                            ttlhold[ttlholdstep++] = curchar;
+                        else if (curchar >= '0' && curchar <= '9' && u8holdstep < 3)
+                            u8hold[u8holdstep++] = curchar;
                         else if (curchar == ':') {
-                            ttlhold[ttlholdstep] = 0;
-                            ((unsigned char*)&fakebuild)[step++] = atousi(ttlhold, "Failed to parse TTL!");
+                            u8hold[u8holdstep] = 0;
+                            ((unsigned char*)&fakebuild)[step++] = atousi(u8hold, "Failed to parse 8 bit integer!");
+                            u8holdstep = 0;
                         }
                         else {
                             printf("Error processing %s!\n", optarg);
                             break;
+                        }
+                        if (progress == max && step == 7) {
+                            u8hold[u8holdstep] = 0;
+                            ((unsigned char*)&fakebuild)[step++] = atousi(u8hold, "Failed to parse 8 bit integer!");
+                            u8holdstep = 0;
                         }
                     }
                     else {
@@ -2401,28 +2535,30 @@ int main(int argc, char *argv[]) {
                         break;
                     }
                 }
-                if (step == 7) {
+                printf("%u\n", step);
+                printf("%u.%u.%u.%u.%u.%u.%u.%u\n", fakebuild.mode, fakebuild.type, fakebuild.fragmentation, fakebuild.disorder, fakebuild.ttl, fakebuild.chksum, fakebuild.badseq, fakebuild.nfragments);
+                if (step == 8) {
                     void* tempptr = realloc(fakebuilds[fakebuild.mode], ++fakebuildlen[fakebuild.mode] * sizeof(struct fakebuild)); //Sucks, but that's too bad.
                     if (tempptr == NULL) {
                         printf("SHIT.\n");
                         die();
                     }
                     else fakebuilds[fakebuild.mode] = tempptr;
-                    printf("Setting fbs[%u][%u] = %u.%u.%u.%u.%u.%u\n", fakebuild.mode, fakebuildlen[fakebuild.mode] - 1, fakebuild.mode, fakebuild.type, fakebuild.fragmentation, fakebuild.disorder, fakebuild.ttl, fakebuild.chksum);
+                    printf("Setting fbs[%u][%u] = %u.%u.%u.%u.%u.%u.%u.%u\n", fakebuild.mode, fakebuildlen[fakebuild.mode] - 1, fakebuild.mode, fakebuild.type, fakebuild.fragmentation, fakebuild.disorder, fakebuild.ttl, fakebuild.chksum, fakebuild.badseq, fakebuild.nfragments);
                     fakebuilds[fakebuild.mode][fakebuildlen[fakebuild.mode] - 1] = fakebuild;
                     for (unsigned int i = 0; i < fakebuildlen[fakebuild.mode]; i++) {
-                        printf("%u.%u.%u.%u.%u.%u\n", fakebuild.mode, fakebuilds[fakebuild.mode][i].type, fakebuilds[fakebuild.mode][i].fragmentation, fakebuilds[fakebuild.mode][i].disorder, fakebuilds[fakebuild.mode][i].ttl, fakebuilds[fakebuild.mode][i].chksum);
+                        printf("%u.%u.%u.%u.%u.%u.%u.%u\n", fakebuild.mode, fakebuilds[fakebuild.mode][i].type, fakebuilds[fakebuild.mode][i].fragmentation, fakebuilds[fakebuild.mode][i].disorder, fakebuilds[fakebuild.mode][i].ttl, fakebuilds[fakebuild.mode][i].chksum, fakebuilds[fakebuild.mode][i].badseq, fakebuilds[fakebuild.mode][i].nfragments);
                     }
                 }
                 else fakebuilderrors++;
                 break;
             case '#':
-                sni_fragment_size = atousi(optarg, "Fragment size should be in range [0 - 65535]\n");
+                sni_fragment_size = atousi(optarg, "(SNI) Fragment size should be in range [0 - 65535]\n");
                 break;
             case 'k':
                 do_fragment_http_persistent = 1;
                 do_native_frag = 1;
-                SET_HTTP_FRAGMENT_SIZE_OPTION(atousi(optarg, "Fragment size should be in range [0 - 0xFFFF]\n"));
+                SET_HTTP_FRAGMENT_SIZE_OPTION(atousi(optarg, "(HTTP PERSISTENT) Fragment size should be in range [0 - 0xFFFF]\n"));
                 break;
             case 'K':
                 host_shiftback = atoi(optarg);
@@ -2434,7 +2570,7 @@ int main(int argc, char *argv[]) {
                 break;
             case 'e':
                 do_fragment_https = 1;
-                https_fragment_size = atousi(optarg, "Fragment size should be in range [0 - 65535]\n");
+                https_fragment_size = atousi(optarg, "(HTTPS) Fragment size should be in range [0 - 65535]\n");
                 break;
             case '^':
                 do_blacklist = 1;
@@ -2446,32 +2582,39 @@ int main(int argc, char *argv[]) {
             case 'X':
                 step = 0;
                 progress = 0;
-                ttlholdstep = 0;
+                u8holdstep = 0;
                 max = strlen(optarg);
-                while (progress < max && step < 7) {
+                while (progress < max && step < 8) {
                     unsigned char curchar = optarg[progress++];
                     if (curchar == '_') {
                         step++;
                     }
                     else if (step != 4 && curchar >= '0' && curchar <= '9') {
                         ((unsigned char*)&fboverrides)[step] = curchar - '0';
-                        overriden = overriden | 1 << (6 - step++);
+                        overriden = overriden | 1 << (7 - step++);
                     }
-                    else if (step == 4) {
-                        if (curchar == '0' && ttlholdstep == 0) {
+                    else if (step == 4 || step == 7) {
+                        if (curchar == '0' && u8holdstep == 0) {
                             ((unsigned char*)&fboverrides)[step] = 0;
-                            overriden = overriden | 1 << (6 - step++);
+                            overriden = overriden | 1 << (7 - step++);
                         }
-                        if (curchar >= '0' && curchar <= '9' && ttlholdstep < 3)
-                            ttlhold[ttlholdstep++] = curchar;
+                        else if (curchar >= '0' && curchar <= '9' && u8holdstep < 3)
+                            u8hold[u8holdstep++] = curchar;
                         else if (curchar == ':') {
-                            ttlhold[ttlholdstep] = 0;
-                            ((unsigned char*)&fboverrides)[step] = atousi(ttlhold, "Failed to parse TTL!");
-                            overriden = overriden | 1 << (6 - step++);
+                            u8hold[u8holdstep] = 0;
+                            ((unsigned char*)&fboverrides)[step] = atousi(u8hold, "Failed to parse 8 bit integer!");
+                            u8holdstep = 0;
+                            overriden = overriden | 1 << (7 - step++);
                         }
                         else {
                             printf("Error processing TTL in %s!\n", optarg);
                             break;
+                        }
+                        if (progress == max && step == 7) {
+                            u8hold[u8holdstep] = 0;
+                            ((unsigned char*)&fboverrides)[step] = atousi(u8hold, "Failed to parse 8 bit integer!");
+                            u8holdstep = 0;
+                            overriden = overriden | 1 << (7 - step++);
                         }
                     }
                     else {
@@ -2590,7 +2733,7 @@ int main(int argc, char *argv[]) {
                 do_tcp_verb = 1;
                 break;
             case 'O':
-                tls_absolute_frag = atousi(optarg, "Fragment size should be in range [0 - 65535]\n");
+                tls_absolute_frag = atousi(optarg, "(ABSOLUTE) Fragment size should be in range [0 - 65535]\n");
                 break;
             case '?':
                 drop_unsecure_dns = 1;
@@ -2927,8 +3070,10 @@ int main(int argc, char *argv[]) {
             for (unsigned int y = 0; y < fakebuildlen[x]; y++)
                 printf("MODE: %u, TYPE: %u, FRAGMODE: %u, DISORDERING: %u, TTL: %u, CHECKSUM: %u, BAD SEQ: %u\n", x, fakebuilds[x][y].type, fakebuilds[x][y].fragmentation, fakebuilds[x][y].disorder, fakebuilds[x][y].ttl, fakebuilds[x][y].chksum, fakebuilds[x][y].badseq);
     }
+    printf("LEN: %u\n", manualfakelen);
+    if (manualfake != NULL) hexprint(manualfake, manualfakelen);
     //Process Super Reverse parameters
-    struct superReverseParams srparams;
+    struct superReverseParams srparams = {0};
     srparams.flags = tls_force_native * 0b100000;
     srparams.flags = srparams.flags | (rplrr_by_sni* 0b10000);
     srparams.flags = srparams.flags | (vortex_frag * 0b1000);
@@ -3099,7 +3244,6 @@ int main(int argc, char *argv[]) {
                         fatass[freeWaiting].recordlength += packet_dataLen;
                         fatass[freeWaiting].seq += packet_dataLen;
                         if (fatass[freeWaiting].recordlength == fatass[freeWaiting].expectedlength) {
-                            printf("Packet completed..\n");
                             packet = fatass[freeWaiting].packet;
                             *((unsigned short*)(packet + 2)) = htons(fatass[freeWaiting].recordlength + fatass[freeWaiting].iphdrlen + fatass[freeWaiting].dOffset);
                             packetLen = fatass[freeWaiting].recordlength + fatass[freeWaiting].iphdrlen + fatass[freeWaiting].dOffset;
@@ -3125,7 +3269,7 @@ int main(int argc, char *argv[]) {
                             if (mss == 1200) printf("ERROR: CONNECTION TRACKING FAIL\n");
                             else if (mss == 0) printf("UH OH!\n");
                             #endif
-                            SAFE_SEND(w_filter, &addr, packet, packetLen, mss);
+                            safe_send(w_filter, &addr, packet, packetLen, mss);
                             should_reinject = 0;
                             }
                         }
@@ -3168,14 +3312,13 @@ int main(int argc, char *argv[]) {
                             printf("DAMN. (");
                             xprint(host_addr, host_len, 0);
                             printf(")\n");
-                            SAFE_SEND(w_filter, &addr, packet, packetLen, mss);
+                            safe_send(w_filter, &addr, packet, packetLen, mss);
                             should_reinject = 0;
                             printf("OK.\n");
                         }
                     }
                     else if (freeWaiting == -1 && packet_dataLen > 41) {
                         if (istlshandshake(packet_data) && packet_data[5] == 1 && (ptrtousce(packet_data + 3) + 5) > packet_dataLen) {
-                            printf("Attempting reconstruction of record with the PDU size of %u\n", ptrtousce(packet_data + 3) + 5);
                             for (unsigned int i = 0; i < fatasslen; i++) {
                                 if (fatass[i].seq == 0 && fatass[i].ip == 0) {
                                     freeWaiting = i;
@@ -3385,6 +3528,7 @@ int main(int argc, char *argv[]) {
                         tcpBaseSeq = ptrtouice(packet + hdrLen + 4);
                         progress = 0;
                         fakePacketLen = 0;
+                        doable = 0;
                         memcpy(host_addrBACK, host_addr, host_len);
                         host_lenBACK = host_len;
                         #ifdef SHOWSNI
@@ -3392,26 +3536,34 @@ int main(int argc, char *argv[]) {
                         xprint(host_addr, host_len, 0);
                         printf("\n");
                         #endif
-                        if (!record_frag && blackwhitelist_check_hostname(host_addr, host_len, 3, fakehost)) {
-                            printf("MATCH!\n", fakehost);
-                            struct clienthello clienthello;
-                            parse_clienthello(packet, &clienthello);
-                            for (unsigned short i = 0; i < clienthello.extensionCount; i++) {
-                                if (clienthello.extensions[i].type == 0) {
-                                    free(clienthello.extensions[i].data);
-                                    clienthello.extensions[i].data = malloc(strlen(fakehost) + 5);
-                                    unsigned char* sni = clienthello.extensions[i].data;
-                                    clienthello.extensions[i].length = strlen(fakehost) + 5;
-                                    *((unsigned short*)(sni)) = htons(strlen(fakehost) + 3);
-                                    sni[2] = 0;
-                                    *((unsigned short*)(sni + 3)) = htons(strlen(fakehost)); //Far too much work.
-                                    memcpy(sni + 5, fakehost, strlen(fakehost));
-                                }
+                        if (blackwhitelist_check_hostname(host_addr, host_len, 3, fakehost)) {
+                            if (manualfake != NULL) {
+                                doable = 1;
+                                memcpy(manualfakepacket, packet, hdrLen + dataOffset);
+                                memcpy(manualfakepacket + hdrLen + dataOffset, manualfake, manualfakelen);
+                                //safe_send(w_filter, &addr, manualfakepacket, manualfakelen + hdrLen + dataOffset, 1200);
                             }
-                            memcpy(fakePacket, packet, hdrLen + dataOffset);
-                            fakePacketLen = rebuild_clienthello(&clienthello, fakePacket + hdrLen + dataOffset) + hdrLen + dataOffset;
-                            delete_clienthello(&clienthello);
-                            setptrtousce(fakePacket + 2, fakePacketLen);
+                            else if (!record_frag) {
+                                printf("MATCH!\n", fakehost);
+                                struct clienthello clienthello;
+                                parse_clienthello(packet, &clienthello);
+                                for (unsigned short i = 0; i < clienthello.extensionCount; i++) {
+                                    if (clienthello.extensions[i].type == 0) {
+                                        free(clienthello.extensions[i].data);
+                                        clienthello.extensions[i].data = malloc(strlen(fakehost) + 5);
+                                        unsigned char* sni = clienthello.extensions[i].data;
+                                        clienthello.extensions[i].length = strlen(fakehost) + 5;
+                                        *((unsigned short*)(sni)) = htons(strlen(fakehost) + 3);
+                                        sni[2] = 0;
+                                        *((unsigned short*)(sni + 3)) = htons(strlen(fakehost)); //Far too much work.
+                                        memcpy(sni + 5, fakehost, strlen(fakehost));
+                                    }
+                                }
+                                memcpy(fakePacket, packet, hdrLen + dataOffset);
+                                fakePacketLen = rebuild_clienthello(&clienthello, fakePacket + hdrLen + dataOffset) + hdrLen + dataOffset;
+                                delete_clienthello(&clienthello);
+                                setptrtousce(fakePacket + 2, fakePacketLen);
+                            }
                         }
                         for (unsigned int i = 0; i < MAX_PACKET_SIZE; i++) reassembleSegments[i] = 255;
                         if (host_shiftback != 0 && host_len + host_shiftback > 0) {
@@ -3423,7 +3575,7 @@ int main(int argc, char *argv[]) {
                                          host_len, &params, &progress);
                         if (super_reverse) {
                             printf("attempting to start super reverse\n");
-                            do_super_reverse_frag(w_filter, &addr, &srparams, &fragmentInfo, host_addr, host_len, packet, packetLen, tcpBaseSeq, 0, NULL, 0);
+                            do_super_reverse_frag(w_filter, &addr, &srparams, &fragmentInfo, host_addr, host_len, packet, packetLen, tcpBaseSeq, 0, doable ? manualfakepacket : !record_frag ? fakePacket : NULL, doable ? manualfakelen + hdrLen + dataOffset : !record_frag ? fakePacketLen : NULL);
                         }
                         printf("finished processing\n");
                         continue;
