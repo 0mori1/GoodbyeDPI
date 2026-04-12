@@ -285,7 +285,7 @@ static struct option long_options[] = {
     {"fake-randgen",required_argument, 0,  'Y' },
     {"fake-override",required_argument,0,  'X' },
     {"seq-offset",  required_argument, 0,  'I' },
-    {"extension-frag",required_argument,0, 'Q' }, //65535:8
+    {"fix-roblox",  required_argument, 0,  'Q' },
     {"set-seed",    required_argument, 0,  'M' },
     {"manual-fake", required_argument, 0,  'W' }, //Override modern fake packet generation.
     {0,             0,                 0,   0  }
@@ -491,19 +491,25 @@ void deinit_all() {
         deinit(filters[i]);
     }
 }
-unsigned char activate_thrash = 0;
+unsigned char activate_dcthrash = 0;
+unsigned char activate_rbxthrash = 0;
 unsigned char doing_conntrack = 0;
 unsigned char synning = 0;
 HANDLE thrash_filter;
+HANDLE rbxthrash_filter;
 HANDLE conntrack_filter;
 HANDLE synner_filter;
 static void sigint_handler(int sig __attribute__((unused))) {
     //printf("Attempting shutdown...\n");
     exiting = 1;
     deinit_all();
-    if (activate_thrash) {
+    if (activate_dcthrash) {
 	    WinDivertShutdown(thrash_filter, WINDIVERT_SHUTDOWN_BOTH);
 	    WinDivertClose(thrash_filter);
+    }
+    if (activate_rbxthrash) {
+	    WinDivertShutdown(rbxthrash_filter, WINDIVERT_SHUTDOWN_BOTH);
+	    WinDivertClose(rbxthrash_filter);
     }
     if (doing_conntrack) {
 	    WinDivertShutdown(conntrack_filter, WINDIVERT_SHUTDOWN_BOTH);
@@ -518,9 +524,13 @@ static void sigint_handler(int sig __attribute__((unused))) {
 static void sigsegv_handler(int sig __attribute__((unused))) {
     exiting = 1;
     deinit_all();
-    if (activate_thrash) {
+    if (activate_dcthrash) {
 	    WinDivertShutdown(thrash_filter, WINDIVERT_SHUTDOWN_BOTH);
 	    WinDivertClose(thrash_filter);
+    }
+    if (activate_rbxthrash) {
+	    WinDivertShutdown(rbxthrash_filter, WINDIVERT_SHUTDOWN_BOTH);
+	    WinDivertClose(rbxthrash_filter);
     }
     if (doing_conntrack) {
 	    WinDivertShutdown(conntrack_filter, WINDIVERT_SHUTDOWN_BOTH);
@@ -1523,8 +1533,9 @@ void xorinate(char* victim, unsigned int victimLen, char* key, unsigned int keyL
         victim[vicPtr] = victim[vicPtr] ^ key[vicPtr % keyLen];
     }
 }
-//Meet the thrash machine!
-unsigned int udp_fakes = 0;
+//Meet the thrash machines!
+unsigned int dc_fakes = 0;
+unsigned int rbx_fakes = 0;
 void* thrash(void* something) {
     unsigned char packet[65536],
                   fake[65536];
@@ -1539,16 +1550,37 @@ void* thrash(void* something) {
             //Encapsulate in trash
             xorinate(fake + 28, 20 % (packetLen - 28), "TOOTROLLED", 10);
 		    WinDivertHelperCalcChecksums(fake, packetLen, &addr, 0);
-            for (unsigned int i = 0; i < (udp_fakes / 2 + udp_fakes % 2); i++) {
+            for (unsigned int i = 0; i < (dc_fakes / 2 + dc_fakes % 2); i++) {
                 WinDivertSend(thrash_filter, fake, packetLen, NULL, &addr);
             }
             WinDivertSend(thrash_filter, packet, packetLen, NULL, &addr);
-            for (unsigned int i = 0; i < (udp_fakes / 2); i++) {
+            for (unsigned int i = 0; i < (dc_fakes / 2); i++) {
                 WinDivertSend(thrash_filter, fake, packetLen, NULL, &addr);
             }
         }
     }
     else printf("thrash init error %u\n", GetLastError());
+}
+void* rbxthrash(void* something) {
+    unsigned char packet[65536],
+                  fake[65536];
+    UINT packetLen;
+    WINDIVERT_ADDRESS addr;
+    rbxthrash_filter = WinDivertOpen("udp and outbound and !impostor and !loopback", WINDIVERT_LAYER_NETWORK, 1, 0);
+    while (!exiting && WinDivertRecv(rbxthrash_filter, packet, 65536, &packetLen, &addr)) {
+		WinDivertHelperCalcChecksums(packet, packetLen, &addr, 0);
+        memcpy(fake, packet, packetLen);
+        //Encapsulate in trash
+		for (unsigned int i = 28; i < packetLen; i++) fake[i] = 0;
+		WinDivertHelperCalcChecksums(fake, packetLen, &addr, 0);
+        for (int i = 0; i < (rbx_fakes / 2 + rbx_fakes % 2); i++) {
+            WinDivertSend(rbxthrash_filter, fake, packetLen, NULL, &addr);
+        }
+        WinDivertSend(rbxthrash_filter, packet, packetLen, NULL, &addr);
+        for (int i = 0; i < (rbx_fakes / 2); i++) {
+            WinDivertSend(rbxthrash_filter, fake, packetLen, NULL, &addr);
+        }
+    }
 }
 //'tis hardcoded.
 #ifndef DOLOCALNETS
@@ -1797,7 +1829,6 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
     if (mss == 1200) printf("ERROR: CONNECTION TRACKING FAIL\n");
     else if (mss == 0) printf("UH OH!\n");
     #endif
-    //printf("starting...\n");
     //printf("Begin Super Reverse\n");
     if (mode != 3 && fakepacket != NULL && fakepacketlen > 0) {
         //build NULL packet.
@@ -1806,7 +1837,6 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             fakePacket[i] = 0;
         
         if (fakebuildlen[0] > 0) { //SEND MODE 0 FAKES
-            printf("sending mode 0 fakes\n");
             struct fragmentInfo tempinfo;
             for (unsigned int i = 0; i < fakebuildlen[0]; i++) {
                 struct fakebuild* poi = &(fakebuilds[0][i]);
@@ -1843,18 +1873,15 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             while (vortex_left != vortex_right) {
                 if (vortex_direction == 0 && vortex_step == vortex_step_left) {
                     vortex_relevant = vortex_right;
-                    //printf("Alternating to RIGHT\n");
                     vortex_step = 0;
                     vortex_direction = 1;
                 }
                 else if (vortex_direction == 1 && vortex_step == vortex_step_right) {
                     vortex_relevant = vortex_left;
-                    //printf("Alternating to LEFT\n");
                     vortex_step = 0;
                     vortex_direction = 0;
                 }
                 else {
-                    //printf("Not alternating.\n");
                     if (vortex_direction == 1) vortex_relevant = vortex_right;
                     if (vortex_direction == 0) vortex_relevant = vortex_left;
                 }
@@ -1897,7 +1924,6 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             }
             break;
         case 2: // --rplrr
-            //printf("Begin RPLRR\n");
             vortex_left = rplrr_by_sni ? beginSni : 0;
             vortex_step = 0;
             if (rplrr_by_sni) fragmentInfoLen -= beginSni;
@@ -1928,19 +1954,15 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
                     goto skipAll;
                 }
                 else {
-                    //printf("REPLACING\n");
-                    //printf("PRE:  %u, %u\n", fragments[i + vortex_left].seq, fragments[i + vortex_left].payloadLen);
                     unsigned int pull = vortex_step % 2 == 0 ? vortex_left : fragmentInfoLen - 1 + vortex_left;
                     fragments[i + vortex_left].seq = fragments[pull].seq;
                     fragments[i + vortex_left].payloadLen = fragments[pull].payloadLen;
-                    //printf("POST: %u, %u\n", fragments[i + vortex_left].seq, fragments[i + vortex_left].payloadLen);
                 }
                 if (vortex_step % 2 == 0) vortex_left++;
                 skipCondLeft:
                 fragmentInfoLen--;
                 skipAll:
                 vortex_step++;
-                //printf("Popped %u, Offset: %u\n", i + vortex_left, vortex_left);
             }
             if (rplrr_by_sni) {
                 for (short i = beginSni - 1; i >= 0; i--) {
@@ -1963,7 +1985,6 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             }
             break;
         case 3: // --record-frag
-            //printf("begin record frag\n");
             struct fragmentationParams rparams = {
                 .mode = 1,
                 .write_fragments = !tls_force_native,
@@ -1997,8 +2018,6 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             if (freeWaiting == -1) {
                 freeWaiting = conntrack_curlen++;
             }
-            //printf("Expecting SEQ %u\n", tcpBaseSeq + (srcPacketLen - hdrLen - dataOffset) + (fragmentInfoLen - 1) * 5);
-            //printf("setting conntrack values at %d\n", freeWaiting);
             conntrack[freeWaiting].flags = 4;
             conntrack[freeWaiting].ip = ptrtoui(srcPacket + 16);
             conntrack[freeWaiting].lowerseq = tcpBaseSeq + (srcPacketLen - hdrLen - dataOffset);
@@ -2019,7 +2038,6 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             unsigned short end_sni;
             recordbuffer = recordbufferpacket + hdrLen + dataOffset;
             memcpy(recordbufferpacket, srcPacket, hdrLen + dataOffset);
-            //printf("building records\n");
             for (unsigned short i = 0; i < fragmentInfoLen; i++) {
                 memcpy(recordbuffer + progress + 5, srcPacket + hdrLen + dataOffset + (fragments[i].seq - tcpBaseSeq), fragments[i].payloadLen);
                 setptrtoui(recordbuffer + progress, 0x00010316); //Clever, not clever.
@@ -2033,10 +2051,6 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
             unsigned int tls_len = progress;
             conntrack[freeWaiting].nextseq = tcpBaseSeq + tls_len;
             progress = 0;
-            //for (unsigned int i = 0; i < fragmentInfoLen; i++) {
-            //    reassemble_tls_bald(recordbuffer + progress); //BALD! BALD! MY EYEEEEEEEEEES!!!!!
-            //    progress += fragments[i].payloadLen + 5;
-            //}
             memcpy(fragmentHolder, srcPacket, hdrLen + dataOffset);
             fragmentInfo->length = 0;
             //printf("fakemap check\n");
@@ -2072,16 +2086,12 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
                 delete_clienthello(&clienthello);
                 setptrtousce(fakePacket + 2, fakePacketLen);
             }
-            //printf("building fragments\n");
             do_fragmentation(filter, pAddr, fragmentInfo, tcpBaseSeq, recordbufferpacket, tls_len + hdrLen + dataOffset, NULL, 0, &rparams, NULL);
-            //printf("built fragments\n");
             conntrack[freeWaiting].nextpacketid = ptrtousce(srcPacket + 4) + fragmentInfo->length;
             //printf("Sending %u fragments.\n", fragmentInfo->length);
             if (!tls_force_native) {
-                //printf("%p, %u\n", fakepacket, fakepacketlen);
                 do_super_reverse_frag(filter, pAddr, &srparams, fragmentInfo, NULL, 0, recordbufferpacket, tls_len + hdrLen + dataOffset, tcpBaseSeq, 0, fakepacket == NULL ? fakePacket : fakepacket, fakepacket == NULL ? fakePacketLen : fakepacketlen);
             }
-            //printf("over\n");
             break;
         default:
             memcpy(fragmentHolder, srcPacket, hdrLen + dataOffset);
@@ -2390,6 +2400,13 @@ int main(int argc, char *argv[]) {
             case 'q':
                 do_block_quic = 1;
                 break;
+            case 'Q': // --fix-roblox
+                activate_rbxthrash = 1;
+                if (optarg && atousi(optarg, "UDP Fake packet assignment error!") > 0)
+                    rbx_fakes = atousi(optarg, "UDP Fake packet assignment error!");
+                else
+                    rbx_fakes = 1;
+                break;
             case 'r':
                 do_host = 1;
                 break;
@@ -2449,13 +2466,13 @@ int main(int argc, char *argv[]) {
 
                 filter_string = new_filter;
                 free(current_filter);
-                activate_thrash = 1;
+                activate_dcthrash = 1;
                 if (!optarg && argv[optind] && argv[optind][0] != '-')
                     optarg = argv[optind];
                 if (optarg && atousi(optarg, "UDP Fake packet assignment error!") > 0)
-                    udp_fakes = atousi(optarg, "UDP Fake packet assignment error!");
+                    dc_fakes = atousi(optarg, "UDP Fake packet assignment error!");
                 else
-                    udp_fakes = 1;
+                    dc_fakes = 1;
                 conntrack_filter_str = conntrack_filter_str_discord_vc;
                 synner_filter_str = synner_filter_str_discord_vc;
                 break;
@@ -2894,15 +2911,8 @@ int main(int argc, char *argv[]) {
                 " --discord-vc [value]     Fixes Discord Voice Chat, hopefully completely. If [value] is above 0,\n"
                 "                          sends [value] fake packets instead of 1.\n"
                 " --sni-frag-size <value>  If above 0, fragments the SNI into <value> sized chunks.\n"
-                " --tls-segment-size <value> Fragments the other 2 parts of the TLS ClientHello into <value> sized chunks.\n"
-                "                          Does NOT work with SNI fragmentation disabled.\n"
-                "                          Can slow down your internet connection dramatically.\n"
                 " --tls-absolute-frag <value> Fragments the entire TLS ClientHello into <value> sized pieces.\n" //For scale, to access youtube videos you send a roughly 2000 byte long ClientHello.
-                "                          Can slow down your internet connection dramatically. And thrash your router.\n"
-                " --tls-force-native       Forces the fragmented TLS ClientHello to be sent in the right order,\n"
-                "                          may fix some websites.\n"
-                " --tls-segmentation <value>  Splits the other parts of the TLS record into <value> equally sized\n"
-                "                             segments. Won't do anything with SNI fragmentation disabled.\n"
+                "                          Can thrash your router.\n"
                 " --compound-frag          Uses vanilla HTTPS splitting and SNI fragmentation at the same time on\n"
                 "                          TLS ClientHello packets.\n"
                 " --native-frag            fragment (split) the packets by sending them in smaller packets, without\n"
@@ -2975,30 +2985,27 @@ int main(int argc, char *argv[]) {
            "TLS Random Fragmentation: %u\n"         /* 12 */
            "TLS Smart Fragmentation: %u (Extension fragment size: %u)\n" /* 13 */
            "Compound Fragmentation: %u\n"           /* 14 */
-           //#ifdef UDPTEST
-           //"UDP fragments: %u\n"                  /* 15 */
-           //#endif
-           "Native fragmentation (splitting): %d\n" /* 16 */
-           "Fragments sending in reverse: %d\n"     /* 17 */
-           "hoSt: %d\n"                             /* 18 */
-           "Host no space: %d\n"                    /* 19 */
-           "Additional space: %d\n"                 /* 20 */
-           "Mix Host: %d\n"                         /* 21 */
-           "HTTP AllPorts: %d\n"                    /* 22 */
-           "HTTP Persistent Nowait: %d\n"           /* 23 */
-           "Fix Discord VC: %u (Fake packets: %u)\n"/* 24 */
-           "DNS redirect: %d\n"                     /* 25 */
-           "DNSv6 redirect: %d\n"                   /* 26 */
-           "Drop unsecure DNS: %d\n"                /* 27 */
-           "Allow missing SNI: %d\n"                /* 28 */
-           "Fake requests, TTL: %s (fixed: %hu, auto: %hu-%hu-%hu, min distance: %hu)\n"  /* 29 */
-           "Fake requests, wrong checksum: %d\n"    /* 30 */
-           "Fake requests, wrong SEQ/ACK: %d\n"     /* 31 */
-           "Fake requests, custom payloads: %d\n"   /* 32 */
-           "Fake requests, resend: %d\n"            /* 33 */
-           "Max payload size: %hu\n",               /* 34 */
-           do_passivedpi,                          /* 1 */ 
-           do_block_quic,                          /* 2 */
+           "Native fragmentation (splitting): %d\n" /* 15 */
+           "Fragments sending in reverse: %d\n"     /* 16 */
+           "hoSt: %d\n"                             /* 17 */
+           "Host no space: %d\n"                    /* 18 */
+           "Additional space: %d\n"                 /* 19 */
+           "Mix Host: %d\n"                         /* 20 */
+           "HTTP AllPorts: %d\n"                    /* 21 */
+           "HTTP Persistent Nowait: %d\n"           /* 22 */
+           "Fix Discord VC: %u (Fake packets: %u)\n"/* 23 */
+           "DNS redirect: %d\n"                     /* 24 */
+           "DNSv6 redirect: %d\n"                   /* 25 */
+           "Drop unsecure DNS: %d\n"                /* 26 */
+           "Allow missing SNI: %d\n"                /* 27 */
+           "Fake requests, TTL: %s (fixed: %hu, auto: %hu-%hu-%hu, min distance: %hu)\n"  /* 28 */
+           "Fake requests, wrong checksum: %d\n"    /* 29 */
+           "Fake requests, wrong SEQ/ACK: %d\n"     /* 30 */
+           "Fake requests, custom payloads: %d\n"   /* 31 */
+           "Fake requests, resend: %d\n"            /* 32 */
+           "Max payload size: %hu\n",               /* 33 */
+           do_passivedpi,                           /* 1 */ 
+           do_block_quic,                           /* 2 */
            (do_fragment_http ? http_fragment_size : 0),           /* 3 */
            (do_fragment_http_persistent ? http_fragment_size : 0),/* 4 */
            (do_fragment_https ? https_fragment_size : 0),         /* 5 */
@@ -3006,34 +3013,31 @@ int main(int argc, char *argv[]) {
            ext_frag_size,         /* 7 */
            do_fragment_by_sni,    /* 8 */
            tls_force_native,      /* 9 */
-           tls_absolute_frag,     /* 11 */
-           tls_rando_frag,        /* 12 */
-           smart_frag, ext_frag_size, /* 13 */
+           tls_absolute_frag,     /* 10 */
+           tls_rando_frag,        /* 11 */
+           smart_frag, ext_frag_size, /* 12 */
            compound_frag,         /* 13 */
-           //#ifdef UDPTEST
-           //udp_fragments,       /* 14 */
-           //#endif
-           do_native_frag,        /* 15 */
-           do_reverse_frag,       /* 16 */
-           do_host,               /* 17 */
-           do_host_removespace,   /* 18 */
-           do_additional_space,   /* 19 */
-           do_host_mixedcase,     /* 20 */
-           do_http_allports,      /* 21 */
-           do_fragment_http_persistent_nowait, /* 22 */
-           activate_thrash, udp_fakes,         /* 23 */
-           do_dnsv4_redirect,                  /* 24 */
-           do_dnsv6_redirect,                  /* 25 */
-           drop_unsecure_dns,                  /* 26 */
-           do_allow_no_sni,                    /* 27 */
-           do_auto_ttl ? "auto" : (do_fake_packet ? "fixed" : "disabled"),  /* 28 */
+           do_native_frag,        /* 14 */
+           do_reverse_frag,       /* 15 */
+           do_host,               /* 16 */
+           do_host_removespace,   /* 17 */
+           do_additional_space,   /* 18 */
+           do_host_mixedcase,     /* 19 */
+           do_http_allports,      /* 20 */
+           do_fragment_http_persistent_nowait, /* 21 */
+           activate_dcthrash, dc_fakes,        /* 22 */
+           do_dnsv4_redirect,                  /* 23 */
+           do_dnsv6_redirect,                  /* 24 */
+           drop_unsecure_dns,                  /* 25 */
+           do_allow_no_sni,                    /* 26 */
+           do_auto_ttl ? "auto" : (do_fake_packet ? "fixed" : "disabled"),  /* 27 */
                ttl_of_fake_packet, do_auto_ttl ? auto_ttl_1 : 0, do_auto_ttl ? auto_ttl_2 : 0,
                do_auto_ttl ? auto_ttl_max : 0, ttl_min_nhops,
-           do_wrong_chksum, /* 29 */
-           do_wrong_seq,    /* 30 */
-           fakes_count,     /* 31 */
-           fakes_resend,    /* 32 */
-           max_payload_size /* 33 */
+           do_wrong_chksum, /* 28 */
+           do_wrong_seq,    /* 29 */
+           fakes_count,     /* 30 */
+           fakes_resend,    /* 31 */
+           max_payload_size /* 32 */
           );
     for (unsigned int x = 0; x < 4; x++)
         for (unsigned int y = 0; y < fakebuildlen[x]; y++)
@@ -3070,8 +3074,6 @@ int main(int argc, char *argv[]) {
             for (unsigned int y = 0; y < fakebuildlen[x]; y++)
                 printf("MODE: %u, TYPE: %u, FRAGMODE: %u, DISORDERING: %u, TTL: %u, CHECKSUM: %u, BAD SEQ: %u\n", x, fakebuilds[x][y].type, fakebuilds[x][y].fragmentation, fakebuilds[x][y].disorder, fakebuilds[x][y].ttl, fakebuilds[x][y].chksum, fakebuilds[x][y].badseq);
     }
-    printf("LEN: %u\n", manualfakelen);
-    if (manualfake != NULL) hexprint(manualfake, manualfakelen);
     //Process Super Reverse parameters
     struct superReverseParams srparams = {0};
     srparams.flags = tls_force_native * 0b100000;
@@ -3106,7 +3108,6 @@ int main(int argc, char *argv[]) {
              "Fragmentation has no effect.");
         die();
     }
-    pthread_t thrash_thread, conntrack_thread, synner_thread;
     struct fragmentationParams params = {tls_absolute_frag > 0 ? 1 : (tls_rando_frag ? 2 : (smart_frag ? 3 : 0))},
                                nparams = {.mode = 0, .write_fragments = do_reverse_frag};
     switch (params.mode) {
@@ -3123,8 +3124,12 @@ int main(int argc, char *argv[]) {
     }
     if (max_payload_size) add_maxpayloadsize_str(max_payload_size);
     finalize_filter_strings();
-    if (activate_thrash) {
-        pthread_create(&thrash_thread, NULL, thrash, NULL);
+    pthread_t dcthrash_thread, rbxthrash_thread, conntrack_thread, synner_thread;
+    if (activate_dcthrash) {
+        pthread_create(&dcthrash_thread, NULL, thrash, NULL);
+    }
+    if (activate_rbxthrash) {
+        pthread_create(&rbxthrash_thread, NULL, rbxthrash, NULL);
     }
     if (conntrack_maxlen) {
         conntrack = calloc(conntrack_maxlen, sizeof(struct conntracksig));
@@ -3314,7 +3319,6 @@ int main(int argc, char *argv[]) {
                             printf(")\n");
                             safe_send(w_filter, &addr, packet, packetLen, mss);
                             should_reinject = 0;
-                            printf("OK.\n");
                         }
                     }
                     else if (freeWaiting == -1 && packet_dataLen > 41) {
@@ -3574,10 +3578,10 @@ int main(int argc, char *argv[]) {
                         do_fragmentation(w_filter, &addr, &fragmentInfo, tcpBaseSeq, packet, packetLen, host_addr,
                                          host_len, &params, &progress);
                         if (super_reverse) {
-                            printf("attempting to start super reverse\n");
+                            //printf("attempting to start super reverse\n");
                             do_super_reverse_frag(w_filter, &addr, &srparams, &fragmentInfo, host_addr, host_len, packet, packetLen, tcpBaseSeq, 0, doable ? manualfakepacket : !record_frag ? fakePacket : NULL, doable ? manualfakelen + hdrLen + dataOffset : !record_frag ? fakePacketLen : NULL);
                         }
-                        printf("finished processing\n");
+                        //printf("finished processing\n");
                         continue;
                     }
                     nparams.compound_frag = 0;
