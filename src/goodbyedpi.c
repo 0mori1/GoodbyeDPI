@@ -288,6 +288,7 @@ static struct option long_options[] = {
     {"fix-roblox",  required_argument, 0,  'Q' },
     {"set-seed",    required_argument, 0,  'M' },
     {"manual-fake", required_argument, 0,  'W' }, //Override modern fake packet generation.
+    {"fake-from-file",required_argument,0, '/' },
     {0,             0,                 0,   0  }
 };
 
@@ -485,12 +486,6 @@ static int deinit(HANDLE handle) {
     }
     return FALSE;
 }
-
-void deinit_all() {
-    for (int i = 0; i < filter_num; i++) {
-        deinit(filters[i]);
-    }
-}
 unsigned char activate_dcthrash = 0;
 unsigned char activate_rbxthrash = 0;
 unsigned char doing_conntrack = 0;
@@ -499,10 +494,8 @@ HANDLE thrash_filter;
 HANDLE rbxthrash_filter;
 HANDLE conntrack_filter;
 HANDLE synner_filter;
-static void sigint_handler(int sig __attribute__((unused))) {
-    //printf("Attempting shutdown...\n");
-    exiting = 1;
-    deinit_all();
+
+void deinit_all() {
     if (activate_dcthrash) {
 	    WinDivertShutdown(thrash_filter, WINDIVERT_SHUTDOWN_BOTH);
 	    WinDivertClose(thrash_filter);
@@ -519,6 +512,13 @@ static void sigint_handler(int sig __attribute__((unused))) {
 	    WinDivertShutdown(synner_filter, WINDIVERT_SHUTDOWN_BOTH);
 	    WinDivertClose(synner_filter);
     }
+    for (int i = 0; i < filter_num; i++) {
+        deinit(filters[i]);
+    }
+}
+static void sigint_handler(int sig __attribute__((unused))) {
+    exiting = 1;
+    deinit_all();
     exit(EXIT_SUCCESS);
 }
 static void sigsegv_handler(int sig __attribute__((unused))) {
@@ -1739,18 +1739,6 @@ void* do_conntrack(void* something) {
                         else {
                             nseq = conntrack[i].offset < (0xFFFFFFFF - seq + 1) ? seq + conntrack[i].offset : 0;
                             setptrtouice(packet + hdrLen + 4, nseq);
-                            /*
-                            switch (conntrack[i].retransmits++) {
-                                case 0:
-                                    do_fragmentation(conntrack_filter, &addr, NULL, 0, packet, packetLen, NULL, 0, &ctparams, NULL);
-                                    should_reinject = 0;
-                                    break;
-                                default:
-                                    setptrtousce(packet + 4, 12345);
-                                    setptrtouice(packet + hdrLen + 4, seq - 200);
-                                    setptrtouice(packet + hdrLen + 8, ptrtouice(packet + hdrLen + 8) + 200);
-                            }
-                            */
                         }
                     }
                     else {
@@ -1781,12 +1769,25 @@ void* do_conntrack(void* something) {
                 WinDivertSend(conntrack_filter, packet, packetLen, NULL, &addr);
             }
         }
-        else {
+        else if (!exiting) {
             printf("conntrack receive error %u\n", GetLastError());
             break;
         }
     }
     else printf("conntrack init error %u\n", GetLastError());
+}
+char interrupt = 0;
+void* interrupter(void* something) {
+    int ch;
+    while (1) {
+        ch = _getch();
+        if (ch == 'r' && interrupt == 0) {
+            interrupt = 1;
+        }
+        else {
+            if (ch == 3) sigint_handler(0); //CTRL + C was accidentally killed. So this is its substitute.
+        }
+    }
 }
 
 char host_addrBACK[HOST_MAXLEN];
@@ -2233,6 +2234,8 @@ int main(int argc, char *argv[]) {
     PWINDIVERT_UDPHDR ppUdpHdr;
     conntrack_info_t dns_conn_info;
     tcp_conntrack_info_t tcp_conn_info;
+    FILE* fakes;
+    char* lists[4] = {0};
     unsigned int findmss = 0, fakebuilderrors = 0;
     int do_passivedpi = 0, do_block_quic = 0,
         do_fragment_http = 0,
@@ -2256,7 +2259,7 @@ int main(int argc, char *argv[]) {
         do_native_frag = 0, do_reverse_frag = 0, record_frag = 0, super_reverse = 0, rplrr = 0, rplrr_by_sni, mss = 0, smart_frag = 0, compound_frag = 0, tls_force_native = 0,
         vortex_frag = 0, vortex_frag_by_sni = 0, vortex_step_left = 1, vortex_step_right = 1; //"Big boy words" my- it's gone...
     unsigned int http_fragment_size = 0, https_fragment_size = 0, sni_fragment_size = 0, ext_frag_size = 0, tls_absolute_frag = 0, tls_recseg_size = 0,
-                 current_fragment_size = 0, host_len, useragent_len, tcpBaseSeq = 0;
+                 current_fragment_size = 0, host_len, useragent_len, tcpBaseSeq = 0, mode = 0;
     unsigned short max_payload_size = 0, cleave_sni = 0, fakePacketLen = 0, progress = 0, progress2 = 0, manualfakelen = 0;
     short host_shiftback = 0;
     BYTE should_send_fake = 0;
@@ -2270,7 +2273,12 @@ int main(int argc, char *argv[]) {
     struct in6_addr dns_temp_addr = {0};
     uint16_t dnsv4_port = htons(53);
     uint16_t dnsv6_port = htons(53);
-    unsigned char *host_addr, *useragent_addr, *method_addr, hdrLen, dataOffset, doable = 0;
+    unsigned char *host_addr, *useragent_addr, *method_addr, hdrLen, dataOffset, doable = 0, lookingforcrlf = 0;
+    const char* fakemodes[] = {
+        "manualfake",
+        "mcfixer"
+    };
+    char fakemodebuffer[256];
     int http_req_fragmented;
     char *hdr_name_addr = NULL, *hdr_value_addr = NULL;
     unsigned int hdr_value_len;
@@ -2591,6 +2599,8 @@ int main(int argc, char *argv[]) {
                 break;
             case '^':
                 do_blacklist = 1;
+                lists[0] = malloc(strlen(optarg) + 1);
+                memcpy(lists[0], optarg, strlen(optarg) + 1);
                 if (!blackwhitelist_load_list(optarg, 0)) {
                     printf("Can't load blacklist from file!\n");
                     exit(ERROR_BLACKLIST_LOAD);
@@ -2643,6 +2653,8 @@ int main(int argc, char *argv[]) {
             case '&':
                 if (!do_blacklist) {
                     do_whitelist = 1;
+                    lists[1] = malloc(strlen(optarg) + 1);
+                    memcpy(lists[1], optarg, strlen(optarg) + 1);
                     if (!blackwhitelist_load_list(optarg, 1)) {
                         printf("Can't load whitelist from file!\n");
                         exit(ERROR_BLACKLIST_LOAD);
@@ -2654,6 +2666,8 @@ int main(int argc, char *argv[]) {
                 break;
             case 'B':
                 fakemap = 1;
+                lists[3] = malloc(strlen(optarg) + 1);
+                memcpy(lists[3], optarg, strlen(optarg) + 1);
                 if (!blackwhitelist_load_list(optarg, 3)) {
                     printf("Can't load fake SNI map from file!\n");
                     exit(ERROR_BLACKLIST_LOAD);
@@ -2695,6 +2709,13 @@ int main(int argc, char *argv[]) {
             case 'D':
                 vortex_step_right = atousi(optarg, "Step bias should be in range [1 - 4]\n") > 0 ? atousi(optarg, "Step bias should be in range [1 - 4]\n") : 1;
                 break;
+            case '/':
+                fakes = fopen(optarg, "r");
+                mode = 0;
+                lookingforcrlf = 0;
+                progress = 0;
+                progress2 = 0;
+                
             case '!': // --dnsv6-addr
                 if ((inet_pton(AF_INET6, optarg, dns_temp_addr.s6_addr) == 1) &&
                     !do_dnsv6_redirect)
@@ -3124,7 +3145,7 @@ int main(int argc, char *argv[]) {
     }
     if (max_payload_size) add_maxpayloadsize_str(max_payload_size);
     finalize_filter_strings();
-    pthread_t dcthrash_thread, rbxthrash_thread, conntrack_thread, synner_thread;
+    pthread_t dcthrash_thread, rbxthrash_thread, conntrack_thread, synner_thread, interrupter_thread;
     if (activate_dcthrash) {
         pthread_create(&dcthrash_thread, NULL, thrash, NULL);
     }
@@ -3135,6 +3156,7 @@ int main(int argc, char *argv[]) {
         conntrack = calloc(conntrack_maxlen, sizeof(struct conntracksig));
         pthread_create(&conntrack_thread, NULL, do_conntrack, NULL);
     }
+    pthread_create(&interrupter_thread, NULL, interrupter, NULL);
     //pthread_create(&synner_thread, NULL, &synner, NULL); //synner is actually a lot more important now.
     puts("\nOpening filter");
     filter_num = 0;
@@ -3175,6 +3197,16 @@ int main(int argc, char *argv[]) {
     signal(SIGSEGV, sigsegv_handler);
 
     while (1) {
+        if (interrupt != 0) {
+            printf("Reloading lists!\n");
+            blackwhitelist_clear_lists();
+            for (unsigned char i = 0; i < 4; i++) {
+                if (lists[i] != NULL && lists[i] != 0) {
+                    blackwhitelist_load_list(lists[i], i);
+                }
+            }
+            interrupt = 0;
+        }
         if (WinDivertRecv(w_filter, realpacket, sizeof(realpacket), &packetLen, &addr)) {
             debug("Got %s packet, len=%d!\n", addr.Outbound ? "outbound" : "inbound",
                    packetLen);

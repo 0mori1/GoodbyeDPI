@@ -166,3 +166,22 @@ int blackwhitelist_check_hostname(const char *host_addr, size_t host_len, char l
         return TRUE;
     }
 }
+
+void blackwhitelist_clear_lists() {
+    if (blacklist) {
+        free(blacklist);
+        blacklist = NULL;
+    }
+    if (whitelist) {
+        free(whitelist);
+        whitelist = NULL;
+    }
+    if (dropper) {
+        free(dropper);
+        dropper = NULL;
+    }
+    if (fakemap) {
+        free(fakemap);
+        fakemap = NULL;
+    }
+}
