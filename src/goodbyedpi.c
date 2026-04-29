@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <time.h>
 #define MAX_PACKET_SIZE 4096 //A bit more memory...
+#define CTRACKMAXPACKETS 10
 #define FATASSMAXLIFE 256
 #define SHOWSNI
 #define DOLOCALNETS
@@ -1677,97 +1678,119 @@ char conntrack_filter_str_default[] = "!tcp.Syn && !impostor and (((inbound or l
      *conntrack_filter_str = conntrack_filter_str_default;
 unsigned int conntrack_maxlen = 0, conntrack_curlen = 0; 
 void* do_conntrack(void* something) {
-    WINDIVERT_ADDRESS addr;
-    unsigned int seq, nseq, ip, packetLen;
+    WINDIVERT_ADDRESS recvaddrs[CTRACKMAXPACKETS], sendaddrs[CTRACKMAXPACKETS], addr;
+    unsigned int seq, nseq, ip, packetLen, addrlen = CTRACKMAXPACKETS * sizeof(WINDIVERT_ADDRESS), nsendaddrs = 0, npackets = 0, sendlength = 0, recvprogress = 0;
     unsigned short clientport = 0;
-    unsigned char packet[65536], should_reinject = 0, hdrLen = 0, dataOffset = 0, final_ack = 0, outbound = 0;
+    unsigned char recvbuffer[65536 * CTRACKMAXPACKETS], sendbuffer[65536 * CTRACKMAXPACKETS], should_reinject = 0, hdrLen = 0, dataOffset = 0, final_ack = 0, outbound = 0;
+    unsigned char* packet = NULL;
     conntrack_filter = WinDivertOpen(conntrack_filter_str, WINDIVERT_LAYER_NETWORK, 2, 0);
     struct fragmentationParams ctparams = {.mode = 0, .compound_frag = 2};
     if (conntrack_filter != INVALID_HANDLE_VALUE)
     while (!exiting) {
-        if (WinDivertRecv(conntrack_filter, packet, 65536, &packetLen, &addr)) {
-            final_ack = 0;
-            should_reinject = 1;
-            hdrLen = (packet[0] & 0xF) * 4;
-            dataOffset = (packet[hdrLen + 12] >> 4) * 4;
-            packetLen = ptrtousce(packet + 2);
-            outbound = addr.Outbound && ptrtousce(packet + hdrLen) != 443;
-            ip = ptrtoui((outbound ? packet + 16 : packet + 12));
-            seq = ptrtouice((outbound ? packet + hdrLen + 4 : packet + hdrLen + 8));
-            clientport = ptrtousce((outbound ? packet + hdrLen : packet + hdrLen + 2));
-            for (unsigned int i = 0; i < conntrack_curlen; i++) {
-                if ((conntrack[i].flags & 4) == 0 && conntrack[i].ip == ip && ((outbound ? seq : seq - conntrack[i].offset) >= conntrack[i].lowerseq && (outbound ? seq : seq - conntrack[i].offset) <= conntrack[i].upperseq)) {
-                    if (*(packet + hdrLen + 13) & 0b00000001) {
+        if (WinDivertRecvEx(conntrack_filter, recvbuffer, 65536 * CTRACKMAXPACKETS, NULL, 0, recvaddrs, &addrlen, NULL)) {
+            sendlength = 0;
+            nsendaddrs = 0;
+            recvprogress = 0;
+            npackets = addrlen / sizeof(WINDIVERT_ADDRESS);
+            //printf("N: %u\n", npackets);
+            for (unsigned int i = 0; i < npackets; i++) {
+                //printf("processing packet %u\n", i);
+                addr = recvaddrs[i];
+                packet = recvbuffer + recvprogress;
+                packetLen = ptrtousce(packet + 2);
+                recvprogress += packetLen;
+                final_ack = 0;
+                should_reinject = 1;
+                hdrLen = (packet[0] & 0xF) * 4;
+                dataOffset = (packet[hdrLen + 12] >> 4) * 4;
+                packetLen = ptrtousce(packet + 2);
+                outbound = addr.Outbound && ptrtousce(packet + hdrLen) != 443;
+                ip = ptrtoui((outbound ? packet + 16 : packet + 12));
+                seq = ptrtouice((outbound ? packet + hdrLen + 4 : packet + hdrLen + 8));
+                clientport = ptrtousce((outbound ? packet + hdrLen : packet + hdrLen + 2));
+                //printf("initialization complete\n");
+                for (unsigned int i = 0; i < conntrack_curlen; i++) {
+                    if ((conntrack[i].flags & 4) == 0 && conntrack[i].ip == ip && ((outbound ? seq : seq - conntrack[i].offset) >= conntrack[i].lowerseq && (outbound ? seq : seq - conntrack[i].offset) <= conntrack[i].upperseq)) {
+                        if (*(packet + hdrLen + 13) & 0b00000001) {
+                            if (outbound) {
+                                //printf("OUTBOUND FIN\n");
+                                conntrack[i].flags = conntrack[i].flags | 2;
+                            }
+                            else {
+                                //printf("INBOUND FIN\n");
+                                conntrack[i].flags = conntrack[i].flags | 1;
+                            }
+                        }
+                        if ((conntrack[i].flags & 3) == 3 && (*(packet + hdrLen + 13) & 0b00010000) > 0) {
+                            //printf("FINALIZING\n");
+                            final_ack = 1;
+                            setptrtouice(packet + hdrLen + 8, seq - conntrack[i].offset);
+                        }
                         if (outbound) {
-                            //printf("OUTBOUND FIN\n");
-                            conntrack[i].flags = conntrack[i].flags | 2;
+                            //*((unsigned short*)(packet + 4)) = htons(conntrack[i].nextpacketid++);
+                            NEWPACKETID(packet);
+                            if (seq == conntrack[i].upperseq) {
+                                setptrtouice(packet + hdrLen + 4, conntrack[i].nextseq);
+                                if (0xFFFFFFFFu - conntrack[i].nextseq + 1 <= (packetLen - hdrLen - dataOffset)) {
+                                    printf("NOTE: ATTEMPTING WRAPAROUND FOR %s\n", conntrack[i].associatedsni);
+                                    conntrack[i].nextseq = 0;
+                                    conntrack[i].wrapoffset = 0xFFFFFFFFu - seq;
+                                }
+                                else conntrack[i].nextseq += (packetLen - hdrLen - dataOffset);
+                                if ((0xFFFFFFFFu - conntrack[i].upperseq + 1) <= (packetLen - hdrLen - dataOffset)) {
+                                    printf("%s WRAPPING AROUND\n", conntrack[i].associatedsni);
+                                    conntrack[i].lowerseq = 0;
+                                    conntrack[i].upperseq = 0;
+                                }
+                                else conntrack[i].upperseq += (packetLen - hdrLen - dataOffset);
+                                conntrack[i].retransmits = 0;
+                            }
+                            else if (seq + (packetLen - hdrLen - dataOffset) > conntrack[i].upperseq) {
+                                nseq = conntrack[i].offset < (0xFFFFFFFF - seq + 1) ? seq + conntrack[i].offset : 0;
+                                setptrtouice(packet + hdrLen + 4, nseq);
+                                conntrack[i].upperseq = seq + (packetLen - hdrLen - dataOffset);
+                            }
+                            else {
+                                nseq = conntrack[i].offset < (0xFFFFFFFF - seq + 1) ? seq + conntrack[i].offset : 0;
+                                setptrtouice(packet + hdrLen + 4, nseq);
+                            }
                         }
                         else {
-                            //printf("INBOUND FIN\n");
-                            conntrack[i].flags = conntrack[i].flags | 1;
+                            setptrtouice(packet + hdrLen + 8, seq < conntrack[i].offset ? 0xFFFFFFFF - (conntrack[i].wrapoffset - seq) : seq - conntrack[i].offset);
                         }
-                    }
-                    if ((conntrack[i].flags & 3) == 3 && (*(packet + hdrLen + 13) & 0b00010000) > 0) {
-                        //printf("FINALIZING\n");
-                        final_ack = 1;
-                        setptrtouice(packet + hdrLen + 8, seq - conntrack[i].offset);
-                    }
-                    if (outbound) {
-                        //*((unsigned short*)(packet + 4)) = htons(conntrack[i].nextpacketid++);
-                        NEWPACKETID(packet);
-                        if (seq == conntrack[i].upperseq) {
-                            setptrtouice(packet + hdrLen + 4, conntrack[i].nextseq);
-                            if (0xFFFFFFFFu - conntrack[i].nextseq + 1 <= (packetLen - hdrLen - dataOffset)) {
-                                printf("NOTE: ATTEMPTING WRAPAROUND FOR %s\n", conntrack[i].associatedsni);
-                                conntrack[i].nextseq = 0;
-                                conntrack[i].wrapoffset = 0xFFFFFFFFu - seq;
-                            }
-                            else conntrack[i].nextseq += (packetLen - hdrLen - dataOffset);
-                            if ((0xFFFFFFFFu - conntrack[i].upperseq + 1) <= (packetLen - hdrLen - dataOffset)) {
-                                printf("%s WRAPPING AROUND\n", conntrack[i].associatedsni);
-                                conntrack[i].lowerseq = 0;
-                                conntrack[i].upperseq = 0;
-                            }
-                            else conntrack[i].upperseq += (packetLen - hdrLen - dataOffset);
-                            conntrack[i].retransmits = 0;
+                        if (final_ack || ((*(packet + hdrLen + 13) & 0b00000100) > 0)) {
+                            conntrack[i].flags = 0; conntrack[i].ip = 0; conntrack[i].lowerseq = 0; 
+                            conntrack[i].upperseq = 0; conntrack[i].offset = 0; conntrack[i].originseq = 0; 
+                            conntrack[i].nextpacketid = 0; conntrack[i].retransmits = 0;
                         }
-                        else if (seq + (packetLen - hdrLen - dataOffset) > conntrack[i].upperseq) {
-                            nseq = conntrack[i].offset < (0xFFFFFFFF - seq + 1) ? seq + conntrack[i].offset : 0;
-                            setptrtouice(packet + hdrLen + 4, nseq);
-                            conntrack[i].upperseq = seq + (packetLen - hdrLen - dataOffset);
+                        break;
+                    }
+                    else if (conntrack[i].ip == ip) {
+                        if (clientport == conntrack[i].clientport && (packet[hdrLen + 13] & 0b00000100) > 0) {
+                            printf("CONNTRACK ERROR (%s, %s, %s: %u%s)\n",conntrack[i].associatedsni, addr.Outbound ? "OUTBOUND" : "INBOUND", addr.Outbound ? "SEQ" : "ACK", seq, conntrack[i].flags & 3 > 0 ? ", CLOSING" : "\0");
+                            conntrack[i].flags = 0; conntrack[i].ip = 0; conntrack[i].lowerseq = 0; 
+                            conntrack[i].upperseq = 0; conntrack[i].offset = 0; conntrack[i].originseq = 0; 
+                            conntrack[i].nextpacketid = 0; conntrack[i].retransmits = 0;
                         }
                         else {
-                            nseq = conntrack[i].offset < (0xFFFFFFFF - seq + 1) ? seq + conntrack[i].offset : 0;
-                            setptrtouice(packet + hdrLen + 4, nseq);
+                            if (outbound && seq > conntrack[i].upperseq && seq - conntrack[i].upperseq < 600) printf("proximity alert, this likely means a missed packet and conntrack is failing. (%s)\n", (addr.Outbound && ptrtousce(packet + hdrLen) != 443) ? "Outbound" : "Inbound");
+                            if (seq < conntrack[i].lowerseq && seq >= conntrack[i].originseq) should_reinject = 0;
                         }
                     }
-                    else {
-                        setptrtouice(packet + hdrLen + 8, seq < conntrack[i].offset ? 0xFFFFFFFF - (conntrack[i].wrapoffset - seq) : seq - conntrack[i].offset);
-                    }
-                    if (final_ack || ((*(packet + hdrLen + 13) & 0b00000100) > 0)) {
-                        conntrack[i].flags = 0; conntrack[i].ip = 0; conntrack[i].lowerseq = 0; 
-                        conntrack[i].upperseq = 0; conntrack[i].offset = 0; conntrack[i].originseq = 0; 
-                        conntrack[i].nextpacketid = 0; conntrack[i].retransmits = 0;
-                    }
-                    break;
                 }
-                else if (conntrack[i].ip == ip) {
-                    if (clientport == conntrack[i].clientport && (packet[hdrLen + 13] & 0b00000100) > 0) {
-                        printf("CONNTRACK ERROR (%s, %s, %s: %u%s)\n",conntrack[i].associatedsni, addr.Outbound ? "OUTBOUND" : "INBOUND", addr.Outbound ? "SEQ" : "ACK", seq, conntrack[i].flags & 3 > 0 ? ", CLOSING" : "\0");
-                        conntrack[i].flags = 0; conntrack[i].ip = 0; conntrack[i].lowerseq = 0; 
-                        conntrack[i].upperseq = 0; conntrack[i].offset = 0; conntrack[i].originseq = 0; 
-                        conntrack[i].nextpacketid = 0; conntrack[i].retransmits = 0;
-                    }
-                    else {
-                        if (outbound && seq > conntrack[i].upperseq && seq - conntrack[i].upperseq < 600) printf("proximity alert, this likely means a missed packet and conntrack is failing. (%s)\n", (addr.Outbound && ptrtousce(packet + hdrLen) != 443) ? "Outbound" : "Inbound");
-                        if (seq < conntrack[i].lowerseq && seq >= conntrack[i].originseq) should_reinject = 0;
-                    }
+                if (should_reinject) {
+                    //printf("attempting to send\n");
+                    WinDivertHelperCalcChecksums(packet, packetLen, &addr, 0);
+                    //printf("%p %p %u\n", sendbuffer + sendlength, packet, packetLen);
+                    //printf("checksums calculated\n");
+                    memcpy(sendbuffer + sendlength, packet, packetLen);
+                    //printf("packet written to buffer\n");
+                    sendaddrs[nsendaddrs++] = addr;
+                    //printf("addr written\n");
+                    sendlength += packetLen;
                 }
             }
-            WinDivertHelperCalcChecksums(packet, packetLen, &addr, 0);
-            if (should_reinject) {
-                WinDivertSend(conntrack_filter, packet, packetLen, NULL, &addr);
-            }
+            WinDivertSendEx(conntrack_filter, sendbuffer, 65536 * CTRACKMAXPACKETS, sendlength, 0, sendaddrs, CTRACKMAXPACKETS * sizeof(WINDIVERT_ADDRESS), NULL);
         }
         else if (!exiting) {
             printf("conntrack receive error %u\n", GetLastError());
