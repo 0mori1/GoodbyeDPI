@@ -13,6 +13,7 @@
 #include <in6addr.h>
 #include <ws2tcpip.h>
 #include "windivert.h"
+#include <windows.h>
 #include "goodbyedpi.h"
 #include "utils/repl_str.h"
 #include "service.h"
