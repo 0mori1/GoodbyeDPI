@@ -3634,7 +3634,7 @@ int main(int argc, char *argv[]) {
                                          host_len, &params, &progress);
                         if (super_reverse) {
                             //printf("attempting to start super reverse\n");
-                            do_super_reverse_frag(w_filter, &addr, &srparams, &fragmentInfo, host_addr, host_len, packet, packetLen, tcpBaseSeq, 0, doable ? manualfakepacket : !record_frag ? fakePacket : NULL, doable ? manualfakelen + hdrLen + dataOffset : !record_frag ? fakePacketLen : NULL);
+                            do_super_reverse_frag(w_filter, &addr, &srparams, &fragmentInfo, host_addr, host_len, packet, packetLen, tcpBaseSeq, 0, doable ? manualfakepacket : !record_frag ? fakePacket : NULL, doable ? manualfakelen + hdrLen + dataOffset : !record_frag ? fakePacketLen : 0);
                         }
                         //printf("finished processing\n");
                         continue;
