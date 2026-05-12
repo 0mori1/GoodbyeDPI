@@ -1791,7 +1791,7 @@ void* do_conntrack(void* something) {
                     sendlength += packetLen;
                 }
             }
-            WinDivertSendEx(conntrack_filter, sendbuffer, 65536 * CTRACKMAXPACKETS, sendlength, 0, sendaddrs, CTRACKMAXPACKETS * sizeof(WINDIVERT_ADDRESS), NULL);
+            WinDivertSendEx(conntrack_filter, sendbuffer, 65536 * CTRACKMAXPACKETS, &sendlength, 0, sendaddrs, CTRACKMAXPACKETS * sizeof(WINDIVERT_ADDRESS), NULL);
         }
         else if (!exiting) {
             printf("conntrack receive error %u\n", GetLastError());
