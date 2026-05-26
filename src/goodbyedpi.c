@@ -1603,7 +1603,6 @@ void* synner(void* something) { //For accessing SYN packets without the clutter 
     unsigned short findmss = 0, mss = 1200, pmss = 0;
     int freeWaiting;
     unsigned int packetLen;
-    synner_filter = WinDivertOpen(synner_filter_str, WINDIVERT_LAYER_NETWORK, 2, 0);
     if (synner_filter != INVALID_HANDLE_VALUE)
     while (!exiting) {
         if (WinDivertRecv(synner_filter, packet, 256, &packetLen, &addr)) {
@@ -1687,7 +1686,6 @@ void* do_conntrack(void* something) {
     unsigned short clientport = 0;
     unsigned char recvbuffer[65536 * CTRACKMAXPACKETS], sendbuffer[65536 * CTRACKMAXPACKETS], should_reinject = 0, hdrLen = 0, dataOffset = 0, final_ack = 0, outbound = 0;
     unsigned char* packet = NULL;
-    conntrack_filter = WinDivertOpen(conntrack_filter_str, WINDIVERT_LAYER_NETWORK, 2, 0);
     struct fragmentationParams ctparams = {.mode = 0, .compound_frag = 2};
     if (conntrack_filter != INVALID_HANDLE_VALUE)
     while (!exiting) {
