@@ -430,10 +430,35 @@ BYTE atoub(const char *str, const char *msg) {
     }
     return (BYTE)res;
 }
-static HANDLE init(char *filter, UINT64 flags) {
+struct filter_to_add {
+    HANDLE* out;
+    char* filter;
+    UINT64 flags;
+    INT16 priority;
+};
+HANDLE* filters2 = NULL;
+struct filter_to_add* filters_to_add = NULL;
+unsigned char nfilters_to_add = 0;
+unsigned char filters_to_addlen = 0;
+void add_filter(HANDLE* out, char* filter, unsigned long long flags, short priority) {
+    //printf("Adding %p, %s, %llu, %u...\n", out, filter, flags, priority);
+    if (nfilters_to_add + 1 > filters_to_addlen) {
+        filters_to_add = realloc(filters_to_add, (filters_to_addlen + 4) * sizeof(struct filter_to_add));
+        if (filters_to_add == NULL) {
+            printf("Shit! Out of memory!\n");
+            exit(-1);
+        }
+        filters_to_addlen += 4;
+    }
+    filters_to_add[nfilters_to_add].out = out;
+    filters_to_add[nfilters_to_add].filter = filter;
+    filters_to_add[nfilters_to_add].flags = flags;
+    filters_to_add[nfilters_to_add++].priority = priority;
+}
+static HANDLE init(char *filter, unsigned long long flags, short priority) {
     LPTSTR errormessage = NULL;
     DWORD errorcode = 0;
-    filter = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 1, flags);
+    filter = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, priority, flags);
     if (filter != INVALID_HANDLE_VALUE)
         return filter;
     errorcode = GetLastError();
@@ -479,7 +504,16 @@ static HANDLE init(char *filter, UINT64 flags) {
     }
     return NULL;
 }
-
+bool init_filters() {
+    filters2 = malloc(nfilters_to_add * sizeof(HANDLE));
+    for (unsigned char i = 0; i < nfilters_to_add; i++) {
+        HANDLE tfilter = init(filters_to_add[i].filter, filters_to_add[i].flags, filters_to_add[i].priority);
+        if (tfilter == NULL) return false;
+        filters2[i] = tfilter;
+        *filters_to_add[i].out = tfilter; 
+    }
+    return true;
+}
 static int deinit(HANDLE handle) {
     if (handle) {
         WinDivertShutdown(handle, WINDIVERT_SHUTDOWN_BOTH);
@@ -498,21 +532,8 @@ HANDLE conntrack_filter;
 HANDLE synner_filter;
 
 void deinit_all() {
-    if (activate_dcthrash) {
-	    WinDivertShutdown(thrash_filter, WINDIVERT_SHUTDOWN_BOTH);
-	    WinDivertClose(thrash_filter);
-    }
-    if (activate_rbxthrash) {
-	    WinDivertShutdown(rbxthrash_filter, WINDIVERT_SHUTDOWN_BOTH);
-	    WinDivertClose(rbxthrash_filter);
-    }
-    if (doing_conntrack) {
-	    WinDivertShutdown(conntrack_filter, WINDIVERT_SHUTDOWN_BOTH);
-	    WinDivertClose(conntrack_filter);
-    }
-    if (synning) {
-	    WinDivertShutdown(synner_filter, WINDIVERT_SHUTDOWN_BOTH);
-	    WinDivertClose(synner_filter);
+    for (unsigned char i = 0; i < nfilters_to_add; i++) {
+	    deinit(filters2[i]);
     }
     for (int i = 0; i < filter_num; i++) {
         deinit(filters[i]);
@@ -526,22 +547,6 @@ static void sigint_handler(int sig __attribute__((unused))) {
 static void sigsegv_handler(int sig __attribute__((unused))) {
     exiting = 1;
     deinit_all();
-    if (activate_dcthrash) {
-	    WinDivertShutdown(thrash_filter, WINDIVERT_SHUTDOWN_BOTH);
-	    WinDivertClose(thrash_filter);
-    }
-    if (activate_rbxthrash) {
-	    WinDivertShutdown(rbxthrash_filter, WINDIVERT_SHUTDOWN_BOTH);
-	    WinDivertClose(rbxthrash_filter);
-    }
-    if (doing_conntrack) {
-	    WinDivertShutdown(conntrack_filter, WINDIVERT_SHUTDOWN_BOTH);
-	    WinDivertClose(conntrack_filter);
-    }
-    if (synning) {
-	    WinDivertShutdown(synner_filter, WINDIVERT_SHUTDOWN_BOTH);
-	    WinDivertClose(synner_filter);
-    }
     printf("Segmentation Fault\n");
     #ifndef DEBUG
     exit(0xC0000005u);
@@ -1543,14 +1548,13 @@ void* thrash(void* something) {
                   fake[65536];
     UINT packetLen;
     WINDIVERT_ADDRESS addr;
-    thrash_filter = WinDivertOpen("outbound and udp and !impostor and !loopback and udp.DstPort > 49999 and udp.DstPort < 50100\0", WINDIVERT_LAYER_NETWORK, 1, 0);
     if (thrash_filter != INVALID_HANDLE_VALUE)
     while (!exiting) {
         if (WinDivertRecv(thrash_filter, packet, 65536, &packetLen, &addr)) {
 		    WinDivertHelperCalcChecksums(packet, packetLen, &addr, 0);
             memcpy(fake, packet, packetLen);
             //Encapsulate in trash
-            xorinate(fake + 28, 20 % (packetLen - 28), "TOOTROLLED", 10);
+            xorinate(fake + 28, 20 % (packetLen - 28), "\xFFTOOTROLLED", 11);
 		    WinDivertHelperCalcChecksums(fake, packetLen, &addr, 0);
             for (unsigned int i = 0; i < (dc_fakes / 2 + dc_fakes % 2); i++) {
                 WinDivertSend(thrash_filter, fake, packetLen, NULL, &addr);
@@ -1568,7 +1572,6 @@ void* rbxthrash(void* something) {
                   fake[65536];
     UINT packetLen;
     WINDIVERT_ADDRESS addr;
-    rbxthrash_filter = WinDivertOpen("udp and outbound and !impostor and !loopback", WINDIVERT_LAYER_NETWORK, 1, 0);
     while (!exiting && WinDivertRecv(rbxthrash_filter, packet, 65536, &packetLen, &addr)) {
 		WinDivertHelperCalcChecksums(packet, packetLen, &addr, 0);
         memcpy(fake, packet, packetLen);
@@ -2434,6 +2437,7 @@ int main(int argc, char *argv[]) {
                 break;
             case 'Q': // --fix-roblox
                 activate_rbxthrash = 1;
+                add_filter(&rbxthrash_filter, "udp and outbound and !impostor and !loopback", 0, 1);
                 if (optarg && atousi(optarg, "UDP Fake packet assignment error!") > 0)
                     rbx_fakes = atousi(optarg, "UDP Fake packet assignment error!");
                 else
@@ -2499,6 +2503,7 @@ int main(int argc, char *argv[]) {
                 filter_string = new_filter;
                 free(current_filter);
                 activate_dcthrash = 1;
+                add_filter(&thrash_filter, "outbound and udp and !impostor and !loopback and udp.DstPort >= 50000 and udp.DstPort <= 50100", 0, 1);
                 if (!optarg && argv[optind] && argv[optind][0] != '-')
                     optarg = argv[optind];
                 if (optarg && atousi(optarg, "UDP Fake packet assignment error!") > 0)
@@ -2526,6 +2531,7 @@ int main(int argc, char *argv[]) {
                 break;
             case 'J': // --mss
                 mss = atousi(optarg, "MSS should be in range [0 - 65535]\n");
+                add_filter(&synner_filter, synner_filter_str, 0, 1);
                 synning = 1;
                 break;
             case 'W':
@@ -2584,8 +2590,6 @@ int main(int argc, char *argv[]) {
                         break;
                     }
                 }
-                printf("%u\n", step);
-                printf("%u.%u.%u.%u.%u.%u.%u.%u\n", fakebuild.mode, fakebuild.type, fakebuild.fragmentation, fakebuild.disorder, fakebuild.ttl, fakebuild.chksum, fakebuild.badseq, fakebuild.nfragments);
                 if (step == 8) {
                     void* tempptr = realloc(fakebuilds[fakebuild.mode], ++fakebuildlen[fakebuild.mode] * sizeof(struct fakebuild)); //Sucks, but that's too bad.
                     if (tempptr == NULL) {
@@ -2593,11 +2597,7 @@ int main(int argc, char *argv[]) {
                         die();
                     }
                     else fakebuilds[fakebuild.mode] = tempptr;
-                    printf("Setting fbs[%u][%u] = %u.%u.%u.%u.%u.%u.%u.%u\n", fakebuild.mode, fakebuildlen[fakebuild.mode] - 1, fakebuild.mode, fakebuild.type, fakebuild.fragmentation, fakebuild.disorder, fakebuild.ttl, fakebuild.chksum, fakebuild.badseq, fakebuild.nfragments);
                     fakebuilds[fakebuild.mode][fakebuildlen[fakebuild.mode] - 1] = fakebuild;
-                    for (unsigned int i = 0; i < fakebuildlen[fakebuild.mode]; i++) {
-                        printf("%u.%u.%u.%u.%u.%u.%u.%u\n", fakebuild.mode, fakebuilds[fakebuild.mode][i].type, fakebuilds[fakebuild.mode][i].fragmentation, fakebuilds[fakebuild.mode][i].disorder, fakebuilds[fakebuild.mode][i].ttl, fakebuilds[fakebuild.mode][i].chksum, fakebuilds[fakebuild.mode][i].badseq, fakebuilds[fakebuild.mode][i].nfragments);
-                    }
                 }
                 else fakebuilderrors++;
                 break;
@@ -2775,6 +2775,7 @@ int main(int argc, char *argv[]) {
             case 'E': // --record-frag
                 record_frag = 1;
                 conntrack_maxlen = (atousi(optarg, "Connection tracking buffer sizing error!") > 0 ? atousi(optarg, "Connection tracking buffer sizing error!") : 1024);
+                add_filter(&conntrack_filter, conntrack_filter_str, 0, 2);
                 doing_conntrack = 1;
                 break;
             case '@': // --dnsv6-port
@@ -3170,16 +3171,6 @@ int main(int argc, char *argv[]) {
     if (max_payload_size) add_maxpayloadsize_str(max_payload_size);
     finalize_filter_strings();
     pthread_t dcthrash_thread, rbxthrash_thread, conntrack_thread, synner_thread, interrupter_thread;
-    if (activate_dcthrash) {
-        pthread_create(&dcthrash_thread, NULL, thrash, NULL);
-    }
-    if (activate_rbxthrash) {
-        pthread_create(&rbxthrash_thread, NULL, rbxthrash, NULL);
-    }
-    if (conntrack_maxlen) {
-        conntrack = calloc(conntrack_maxlen, sizeof(struct conntracksig));
-        pthread_create(&conntrack_thread, NULL, do_conntrack, NULL);
-    }
     pthread_create(&interrupter_thread, NULL, interrupter, NULL);
     //pthread_create(&synner_thread, NULL, &synner, NULL); //synner is actually a lot more important now.
     puts("\nOpening filter");
@@ -3188,7 +3179,7 @@ int main(int argc, char *argv[]) {
         /* IPv4 only filter for inbound RST packets with ID [0x0; 0xF] */
         filters[filter_num] = init(
             filter_passive_string,
-            WINDIVERT_FLAG_DROP);
+            WINDIVERT_FLAG_DROP, 1);
         if (filters[filter_num] == NULL)
             die();
         filter_num++;
@@ -3197,7 +3188,7 @@ int main(int argc, char *argv[]) {
     if (do_block_quic) {
         filters[filter_num] = init(
             FILTER_PASSIVE_BLOCK_QUIC,
-            WINDIVERT_FLAG_DROP);
+            WINDIVERT_FLAG_DROP, 1);
         if (filters[filter_num] == NULL)
             die();
         filter_num++;
@@ -3207,7 +3198,7 @@ int main(int argc, char *argv[]) {
      * IPv4 & IPv6 filter for inbound HTTP redirection packets and
      * active DPI circumvention
      */
-    filters[filter_num] = init(filter_string, 0);
+    filters[filter_num] = init(filter_string, 0, 1);
     //printf("My filter is %s\n", filter_string);
     w_filter = filters[filter_num];
     filter_num++;
@@ -3215,6 +3206,20 @@ int main(int argc, char *argv[]) {
     for (unsigned int i = 0; i < filter_num; i++) {
         if (filters[i] == NULL)
             die();
+    }
+    if (!init_filters()) {
+        printf("Error opening extended filters!\n");
+        die();
+    }
+    if (activate_dcthrash) {
+        pthread_create(&dcthrash_thread, NULL, thrash, NULL);
+    }
+    if (activate_rbxthrash) {
+        pthread_create(&rbxthrash_thread, NULL, rbxthrash, NULL);
+    }
+    if (conntrack_maxlen) {
+        conntrack = calloc(conntrack_maxlen, sizeof(struct conntracksig));
+        pthread_create(&conntrack_thread, NULL, do_conntrack, NULL);
     }
     printf("Filter activated, GoodbyeDPI is now running!\n");
     signal(SIGINT, sigint_handler);

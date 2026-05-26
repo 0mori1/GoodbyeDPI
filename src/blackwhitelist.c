@@ -77,6 +77,7 @@ int blackwhitelist_load_list(const char *filename, char list) {
         while ((read = getline(&line, &linelen, fp)) != -1) {
         /* works with both \n and \r\n */
         line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '#') continue;
         if (strlen(line) > HOST_MAXLEN) {
             printf("WARNING: host %s exceeds maximum host length and has not been added\n",
                 line);
@@ -95,6 +96,7 @@ int blackwhitelist_load_list(const char *filename, char list) {
         while ((read = getline(&line, &linelen, fp)) != -1) {
         /* works with both \n and \r\n */
         line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '#') continue;
         spacepos = strcspn(line, " ");
         if (spacepos == strlen(line)) {
             printf("WARNING: Error parsing line! Skipping.\n");
