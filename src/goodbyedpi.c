@@ -37,8 +37,6 @@ WINSOCK_API_LINKAGE INT WSAAPI inet_pton(INT Family, LPCSTR pStringBuf, PVOID pA
 
 #define die() do { sleep(20); exit(EXIT_FAILURE); } while (0)
 
-#define MAX_FILTERS 4
-
 #define DIVERT_NO_LOCALNETSv4_DST "(" \
                    "(ip.DstAddr < 127.0.0.1 or ip.DstAddr > 127.255.255.255) and " \
                    "(ip.DstAddr < 10.0.0.0 or ip.DstAddr > 10.255.255.255) and " \
@@ -212,7 +210,6 @@ enum ERROR_CODE{
 
 static int running_from_service = 0;
 static int exiting = 0;
-static HANDLE filters[MAX_FILTERS];
 static int filter_num = 0;
 static const char http10_redirect_302[] = "HTTP/1.0 302 ";
 static const char http11_redirect_302[] = "HTTP/1.1 302 ";
@@ -436,7 +433,7 @@ struct filter_to_add {
     UINT64 flags;
     INT16 priority;
 };
-HANDLE* filters2 = NULL;
+HANDLE* filters = NULL;
 struct filter_to_add* filters_to_add = NULL;
 unsigned char nfilters_to_add = 0;
 unsigned char filters_to_addlen = 0;
@@ -455,62 +452,59 @@ void add_filter(HANDLE* out, char* filter, unsigned long long flags, short prior
     filters_to_add[nfilters_to_add].flags = flags;
     filters_to_add[nfilters_to_add++].priority = priority;
 }
-static HANDLE init(char *filter, unsigned long long flags, short priority) {
+bool init_filters() {
     LPTSTR errormessage = NULL;
     DWORD errorcode = 0;
-    filter = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, priority, flags);
-    if (filter != INVALID_HANDLE_VALUE)
-        return filter;
-    errorcode = GetLastError();
-    FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
-                  FORMAT_MESSAGE_IGNORE_INSERTS,
-                  NULL, errorcode, MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT),
-                  (LPTSTR)&errormessage, 0, NULL);
-    printf("Error opening filter: %d %s\n", errorcode, errormessage);
-    LocalFree(errormessage);
-    switch (errorcode) {
-        case 2:
-            printf("The driver files WinDivert32.sys or WinDivert64.sys were not found.\n");
-            break;
-        case 654:
-            printf("An incompatible version of the WinDivert driver is currently loaded.\n"
-                   "Please unload it with the following commands ran as administrator:\n\n"
-                   "sc stop windivert\n"
-                   "sc delete windivert\n"
-                   "sc stop windivert14\n"
-                   "sc delete windivert14\n");
-            break;
-        case 1275:
-            printf("This error occurs for various reasons, including:\n"
-                   "the WinDivert driver is blocked by security software; or\n"
-                   "you are using a virtualization environment that does not support drivers.\n");
-            break;
-        case 1753:
-            printf("This error occurs when the Base Filtering Engine service has been disabled.\n"
-                   "Enable Base Filtering Engine service.\n");
-            break;
-        case 577:
-            printf("Could not load driver due to invalid digital signature.\n"
-                   "Windows Server 2016 systems must have secure boot disabled to be \n"
-                   "able to load WinDivert driver.\n"
-                   "Windows 7 systems must be up-to-date or at least have KB3033929 installed.\n"
-                   "https://www.microsoft.com/en-us/download/details.aspx?id=46078\n\n"
-                   "WARNING! If you see this error on Windows 7, it means your system is horribly "
-                   "outdated and SHOULD NOT BE USED TO ACCESS THE INTERNET!\n"
-                   "Most probably, you don't have security patches installed and anyone in your LAN or "
-                   "public Wi-Fi network can get full access to your computer (MS17-010 and others).\n"
-                   "You should install updates IMMEDIATELY.\n");
-            break;
-    }
-    return NULL;
-}
-bool init_filters() {
-    filters2 = malloc(nfilters_to_add * sizeof(HANDLE));
+    HANDLE tfilter;
+    filters = malloc(nfilters_to_add * sizeof(HANDLE));
     for (unsigned char i = 0; i < nfilters_to_add; i++) {
-        HANDLE tfilter = init(filters_to_add[i].filter, filters_to_add[i].flags, filters_to_add[i].priority);
-        if (tfilter == NULL) return false;
-        filters2[i] = tfilter;
-        *filters_to_add[i].out = tfilter; 
+        tfilter = WinDivertOpen(filters_to_add[i].filter, WINDIVERT_LAYER_NETWORK, filters_to_add[i].priority, filters_to_add[i].flags);
+        if (tfilter == INVALID_HANDLE_VALUE) {
+            errorcode = GetLastError();
+            FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                          FORMAT_MESSAGE_IGNORE_INSERTS,
+                          NULL, errorcode, MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT),
+                          (LPTSTR)&errormessage, 0, NULL);
+            printf("Error opening filter: %d %s\n", errorcode, errormessage);
+            LocalFree(errormessage);
+            switch (errorcode) {
+                case 2:
+                    printf("The driver files WinDivert32.sys or WinDivert64.sys were not found.\n");
+                    break;
+                case 654:
+                    printf("An incompatible version of the WinDivert driver is currently loaded.\n"
+                           "Please unload it with the following commands ran as administrator:\n\n"
+                           "sc stop windivert\n"
+                           "sc delete windivert\n"
+                           "sc stop windivert14\n"
+                           "sc delete windivert14\n");
+                    break;
+                case 1275:
+                    printf("This error occurs for various reasons, including:\n"
+                           "the WinDivert driver is blocked by security software; or\n"
+                           "you are using a virtualization environment that does not support drivers.\n");
+                    break;
+                case 1753:
+                    printf("This error occurs when the Base Filtering Engine service has been disabled.\n"
+                           "Enable Base Filtering Engine service.\n");
+                    break;
+                case 577:
+                    printf("Could not load driver due to invalid digital signature.\n"
+                           "Windows Server 2016 systems must have secure boot disabled to be \n"
+                           "able to load WinDivert driver.\n"
+                           "Windows 7 systems must be up-to-date or at least have KB3033929 installed.\n"
+                           "https://www.microsoft.com/en-us/download/details.aspx?id=46078\n\n"
+                           "WARNING! If you see this error on Windows 7, it means your system is horribly "
+                           "outdated and SHOULD NOT BE USED TO ACCESS THE INTERNET!\n"
+                           "Most probably, you don't have security patches installed and anyone in your LAN or "
+                           "public Wi-Fi network can get full access to your computer (MS17-010 and others).\n"
+                           "You should install updates IMMEDIATELY.\n");
+                    break;
+            }
+            return false;
+        }
+        filters[i] = tfilter;
+        if (filters_to_add[i].out != NULL) *filters_to_add[i].out = tfilter; 
     }
     return true;
 }
@@ -533,10 +527,7 @@ HANDLE synner_filter;
 
 void deinit_all() {
     for (unsigned char i = 0; i < nfilters_to_add; i++) {
-	    deinit(filters2[i]);
-    }
-    for (int i = 0; i < filter_num; i++) {
-        deinit(filters[i]);
+	    deinit(filters[i]);
     }
 }
 static void sigint_handler(int sig __attribute__((unused))) {
@@ -3172,41 +3163,25 @@ int main(int argc, char *argv[]) {
     pthread_create(&interrupter_thread, NULL, interrupter, NULL);
     //pthread_create(&synner_thread, NULL, &synner, NULL); //synner is actually a lot more important now.
     puts("\nOpening filter");
-    filter_num = 0;
-    if (do_passivedpi) {
+    if (do_passivedpi)
         /* IPv4 only filter for inbound RST packets with ID [0x0; 0xF] */
-        filters[filter_num] = init(
+        add_filter(NULL,
             filter_passive_string,
             WINDIVERT_FLAG_DROP, 1);
-        if (filters[filter_num] == NULL)
-            die();
-        filter_num++;
-    }
 
-    if (do_block_quic) {
-        filters[filter_num] = init(
+    if (do_block_quic)
+        add_filter(NULL,
             FILTER_PASSIVE_BLOCK_QUIC,
             WINDIVERT_FLAG_DROP, 1);
-        if (filters[filter_num] == NULL)
-            die();
-        filter_num++;
-    }
 
     /* 
      * IPv4 & IPv6 filter for inbound HTTP redirection packets and
      * active DPI circumvention
      */
-    filters[filter_num] = init(filter_string, 0, 1);
-    //printf("My filter is %s\n", filter_string);
-    w_filter = filters[filter_num];
-    filter_num++;
+    add_filter(&w_filter, filter_string, 0, 1);
 
-    for (unsigned int i = 0; i < filter_num; i++) {
-        if (filters[i] == NULL)
-            die();
-    }
     if (!init_filters()) {
-        printf("Error opening extended filters!\n");
+        printf("Error opening filter!\n");
         die();
     }
     if (activate_dcthrash) {
