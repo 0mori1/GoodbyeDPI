@@ -361,6 +361,29 @@ static void finalize_filter_strings() {
     filter_passive_string = newstr;
 }
 
+unsigned char epoch2 = 1;
+unsigned int genrand32(unsigned int seed, unsigned int min, unsigned int max) {
+    for (unsigned char i = 0; i < epoch2; i++) {
+        seed = (seed >> (seed % 32)) + (seed << (32 - (seed % 32)));
+        seed = seed + seed % 7 + 1;
+    }
+    epoch2 += 1 + (epoch2 + 1 == 0);
+    if (max != 0)
+        seed = min + (seed % (max + 1 - min));
+    return seed;
+}
+unsigned int genrands32(int seed, int min, int max) {
+    for (unsigned char i = 0; i < epoch2; i++) {
+        seed = (seed >> (seed % 32)) + (seed << (32 - (seed % 32)));
+        seed += seed % 7 + 1;
+    }
+    epoch2 += 1 + (epoch2 + 1) == 0;
+    if (max != 0) {
+        seed = seed & 0x7FFFFFFF;
+        seed = min + (seed % (max + 1 - min));
+    }
+    return seed;
+}
 unsigned short epoch = 0;
 unsigned short genrand16(unsigned short seed) {
     unsigned short shift;
@@ -1091,6 +1114,18 @@ struct fragmentationParams {
     unsigned short extfragparamlen;
     struct extfragparam* extfragparams;
 };
+void parse_flags(unsigned char flags, char* out) {
+    out[8] = 0;
+    out[7] = 'F' * ((flags & 0b00000001) > 0) + '.' * ((flags & 0b00000001) > 0);
+    out[6] = 'S' * ((flags & 0b00000010) > 0) + '.' * ((flags & 0b00000010) > 0);
+    out[5] = 'R' * ((flags & 0b00000100) > 0) + '.' * ((flags & 0b00000100) > 0);
+    out[4] = 'P' * ((flags & 0b00001000) > 0) + '.' * ((flags & 0b00001000) > 0);
+    out[3] = 'A' * ((flags & 0b00010000) > 0) + '.' * ((flags & 0b00010000) > 0);
+    out[2] = 'U' * ((flags & 0b00100000) > 0) + '.' * ((flags & 0b00100000) > 0);
+    out[1] = 'E' * ((flags & 0b01000000) > 0) + '.' * ((flags & 0b01000000) > 0);
+    out[0] = 'C' * ((flags & 0b10000000) > 0) + '.' * ((flags & 0b10000000) > 0);
+    printf("RETURNING: %s\n", out);
+}
 void do_fragmentation(HANDLE filter, WINDIVERT_ADDRESS* pAddr, struct fragmentInfo* fragmentInfo, unsigned int tcpBaseSeq, unsigned char* packet, unsigned short packetLen,
     unsigned char* host_addr, unsigned short host_len, struct fragmentationParams* params, unsigned short* pprogress) {
     //printf("initializing fragmenter\n");
@@ -1176,11 +1211,8 @@ void do_fragmentation(HANDLE filter, WINDIVERT_ADDRESS* pAddr, struct fragmentIn
                 }
                 unsigned short extfragsize = 0;
                 while (progress != packetLen - hdrLen - dataOffset) {
-                    //printf("AF progress: %u\n", progress);
                     skipcycle = 0;
                     current_fragment_size = extfragsize == 0 ? target_fragment_size : ext_frag_size;
-                    //printf("TFS: %u\n", target_fragment_size);
-                    //printf("CFS: %u\n", current_fragment_size);
                     if (selextfraginfo == NULL) {
                         for (unsigned short i = 0; i < elementcount; i++) {
                             if (extfraginfo[i].length == 0) continue;
@@ -1197,7 +1229,7 @@ void do_fragmentation(HANDLE filter, WINDIVERT_ADDRESS* pAddr, struct fragmentIn
                     else if (hdrLen + dataOffset + progress + current_fragment_size >= selextfraginfo->offset + selextfraginfo->length) { //Exitting extension, fragment until the end of the extension.
                         current_fragment_size = (unsigned int) (selextfraginfo->offset + selextfraginfo->length - hdrLen - dataOffset - progress);
                         extfragsize = 0;
-                        selextfraginfo->length = 0; //Make extension invalid, as it has already been processed.
+                        selextfraginfo->length = 0;
                         selextfraginfo = NULL;
                         if (current_fragment_size == 0) continue;
                     }
@@ -1677,6 +1709,7 @@ void* do_conntrack(void* something) {
     unsigned short clientport = 0;
     unsigned char recvbuffer[65536 * CTRACKMAXPACKETS], sendbuffer[65536 * CTRACKMAXPACKETS], should_reinject = 0, hdrLen = 0, dataOffset = 0, final_ack = 0, outbound = 0;
     unsigned char* packet = NULL;
+    char flagstr[9];
     struct fragmentationParams ctparams = {.mode = 0, .compound_frag = 2};
     if (conntrack_filter != INVALID_HANDLE_VALUE)
     while (!exiting) {
@@ -1703,83 +1736,76 @@ void* do_conntrack(void* something) {
                 clientport = ptrtousce((outbound ? packet + hdrLen : packet + hdrLen + 2));
                 //printf("initialization complete\n");
                 for (unsigned int i = 0; i < conntrack_curlen; i++) {
-                    if ((conntrack[i].flags & 4) == 0 && conntrack[i].ip == ip && ((outbound ? seq : seq - conntrack[i].offset) >= conntrack[i].lowerseq && (outbound ? seq : seq - conntrack[i].offset) <= conntrack[i].upperseq)) {
-                        if (*(packet + hdrLen + 13) & 0b00000001) {
-                            if (outbound) {
-                                //printf("OUTBOUND FIN\n");
-                                conntrack[i].flags = conntrack[i].flags | 2;
-                            }
-                            else {
-                                //printf("INBOUND FIN\n");
-                                conntrack[i].flags = conntrack[i].flags | 1;
-                            }
-                        }
-                        if ((conntrack[i].flags & 3) == 3 && (*(packet + hdrLen + 13) & 0b00010000) > 0) {
-                            //printf("FINALIZING\n");
-                            final_ack = 1;
-                            setptrtouice(packet + hdrLen + 8, seq - conntrack[i].offset);
-                        }
-                        if (outbound) {
-                            //*((unsigned short*)(packet + 4)) = htons(conntrack[i].nextpacketid++);
-                            NEWPACKETID(packet);
-                            if (seq == conntrack[i].upperseq) {
-                                setptrtouice(packet + hdrLen + 4, conntrack[i].nextseq);
-                                if (0xFFFFFFFFu - conntrack[i].nextseq + 1 <= (packetLen - hdrLen - dataOffset)) {
-                                    printf("NOTE: ATTEMPTING WRAPAROUND FOR %s\n", conntrack[i].associatedsni);
-                                    conntrack[i].nextseq = 0;
-                                    conntrack[i].wrapoffset = 0xFFFFFFFFu - seq;
-                                }
-                                else conntrack[i].nextseq += (packetLen - hdrLen - dataOffset);
-                                if ((0xFFFFFFFFu - conntrack[i].upperseq + 1) <= (packetLen - hdrLen - dataOffset)) {
-                                    printf("%s WRAPPING AROUND\n", conntrack[i].associatedsni);
-                                    conntrack[i].lowerseq = 0;
-                                    conntrack[i].upperseq = 0;
-                                }
-                                else conntrack[i].upperseq += (packetLen - hdrLen - dataOffset);
-                                conntrack[i].retransmits = 0;
-                            }
-                            else if (seq + (packetLen - hdrLen - dataOffset) > conntrack[i].upperseq) {
-                                nseq = conntrack[i].offset < (0xFFFFFFFF - seq + 1) ? seq + conntrack[i].offset : 0;
-                                setptrtouice(packet + hdrLen + 4, nseq);
-                                conntrack[i].upperseq = seq + (packetLen - hdrLen - dataOffset);
-                            }
-                            else {
-                                nseq = conntrack[i].offset < (0xFFFFFFFF - seq + 1) ? seq + conntrack[i].offset : 0;
-                                setptrtouice(packet + hdrLen + 4, nseq);
-                            }
-                        }
-                        else {
-                            setptrtouice(packet + hdrLen + 8, seq < conntrack[i].offset ? 0xFFFFFFFF - (conntrack[i].wrapoffset - seq) : seq - conntrack[i].offset);
-                        }
-                        if (final_ack || ((*(packet + hdrLen + 13) & 0b00000100) > 0)) {
-                            conntrack[i].flags = 0; conntrack[i].ip = 0; conntrack[i].lowerseq = 0; 
-                            conntrack[i].upperseq = 0; conntrack[i].offset = 0; conntrack[i].originseq = 0; 
-                            conntrack[i].nextpacketid = 0; conntrack[i].retransmits = 0;
-                        }
-                        break;
-                    }
-                    else if (conntrack[i].ip == ip) {
-                        if (clientport == conntrack[i].clientport && (packet[hdrLen + 13] & 0b00000100) > 0) {
-                            printf("CONNTRACK ERROR (%s, %s, %s: %u%s)\n",conntrack[i].associatedsni, addr.Outbound ? "OUTBOUND" : "INBOUND", addr.Outbound ? "SEQ" : "ACK", seq, conntrack[i].flags & 3 > 0 ? ", CLOSING" : "\0");
-                            conntrack[i].flags = 0; conntrack[i].ip = 0; conntrack[i].lowerseq = 0; 
-                            conntrack[i].upperseq = 0; conntrack[i].offset = 0; conntrack[i].originseq = 0; 
-                            conntrack[i].nextpacketid = 0; conntrack[i].retransmits = 0;
-                        }
-                        else {
-                            if (outbound && seq > conntrack[i].upperseq && seq - conntrack[i].upperseq < 600) printf("proximity alert, this likely means a missed packet and conntrack is failing. (%s)\n", (addr.Outbound && ptrtousce(packet + hdrLen) != 443) ? "Outbound" : "Inbound");
+                    if ((conntrack[i].flags & 4) == 0 && conntrack[i].ip == ip) {
+                        if (((outbound ? seq : seq - conntrack[i].offset) >= conntrack[i].lowerseq && (outbound ? seq : seq - conntrack[i].offset) <= conntrack[i].upperseq) || clientport == conntrack[i].clientport) {
+                            //if (!((outbound ? seq : seq - conntrack[i].offset) >= conntrack[i].lowerseq && (outbound ? seq : seq - conntrack[i].offset) <= conntrack[i].upperseq)) printf("CONNTRACK DESYNC! (%s, %s, PACKET %s: %u, ENTRY: %u-%u, OFFSET: %u)\n", conntrack[i].associatedsni, addr.Outbound ? "OUTBOUND" : "INBOUND", addr.Outbound ? "SEQ" : "ACK", seq, conntrack[i].lowerseq, conntrack[i].upperseq, conntrack[i].offset);
                             if (seq < conntrack[i].lowerseq && seq >= conntrack[i].originseq) should_reinject = 0;
+                            if (*(packet + hdrLen + 13) & 0b00000001) {
+                                if (outbound) {
+                                    //printf("OUTBOUND FIN\n");
+                                    conntrack[i].flags = conntrack[i].flags | 2;
+                                }
+                                else {
+                                    //printf("INBOUND FIN\n");
+                                    conntrack[i].flags = conntrack[i].flags | 1;
+                                }
+                            }
+                            if ((conntrack[i].flags & 3) == 3 && (*(packet + hdrLen + 13) & 0b00010000) > 0) {
+                                //printf("FINALIZING\n");
+                                final_ack = 1;
+                                setptrtouice(packet + hdrLen + 8, seq - conntrack[i].offset);
+                            }
+                            if (outbound) {
+                                //*((unsigned short*)(packet + 4)) = htons(conntrack[i].nextpacketid++);
+                                NEWPACKETID(packet);
+                                if (seq == conntrack[i].upperseq) {
+                                    setptrtouice(packet + hdrLen + 4, conntrack[i].nextseq);
+                                    if (0xFFFFFFFFu - conntrack[i].nextseq + 1 <= (packetLen - hdrLen - dataOffset)) {
+                                        printf("NOTE: ATTEMPTING WRAPAROUND FOR %s\n", conntrack[i].associatedsni);
+                                        conntrack[i].nextseq = 0;
+                                        conntrack[i].wrapoffset = 0xFFFFFFFFu - seq;
+                                    }
+                                    else conntrack[i].nextseq += (packetLen - hdrLen - dataOffset);
+                                    if ((0xFFFFFFFFu - conntrack[i].upperseq + 1) <= (packetLen - hdrLen - dataOffset)) {
+                                        printf("%s WRAPPING AROUND\n", conntrack[i].associatedsni);
+                                        conntrack[i].lowerseq = 0;
+                                        conntrack[i].upperseq = 0;
+                                    }
+                                    else conntrack[i].upperseq += (packetLen - hdrLen - dataOffset);
+                                    conntrack[i].retransmits = 0;
+                                }
+                                else if (seq + (packetLen - hdrLen - dataOffset) > conntrack[i].upperseq) {
+                                    nseq = conntrack[i].offset < (0xFFFFFFFF - seq + 1) ? seq + conntrack[i].offset : 0;
+                                    setptrtouice(packet + hdrLen + 4, nseq);
+                                    conntrack[i].upperseq = seq + (packetLen - hdrLen - dataOffset);
+                                }
+                                else {
+                                    nseq = conntrack[i].offset < (0xFFFFFFFF - seq + 1) ? seq + conntrack[i].offset : 0;
+                                    setptrtouice(packet + hdrLen + 4, nseq);
+                                }
+                            }
+                            else {
+                                setptrtouice(packet + hdrLen + 8, seq < conntrack[i].offset ? 0xFFFFFFFF - (conntrack[i].wrapoffset - seq) : seq - conntrack[i].offset);
+                            }
+                            if (final_ack || ((*(packet + hdrLen + 13) & 0b00000100) > 0)) {
+                                conntrack[i].flags = 0; conntrack[i].ip = 0; conntrack[i].lowerseq = 0; 
+                                conntrack[i].upperseq = 0; conntrack[i].offset = 0; conntrack[i].originseq = 0; 
+                                conntrack[i].nextpacketid = 0; conntrack[i].retransmits = 0;
+                            }
+                            if ((packet[hdrLen + 13] & 0b00000100) > 0) {
+                                printf("CONNTRACK RESET ERROR (%s, %s, %s: %u%s)\n", conntrack[i].associatedsni, addr.Outbound ? "OUTBOUND" : "INBOUND", addr.Outbound ? "SEQ" : "ACK", seq, conntrack[i].flags & 3 > 0 ? ", CLOSING" : "\0");
+                                conntrack[i].flags = 0; conntrack[i].ip = 0; conntrack[i].lowerseq = 0; 
+                                conntrack[i].upperseq = 0; conntrack[i].offset = 0; conntrack[i].originseq = 0; 
+                                conntrack[i].nextpacketid = 0; conntrack[i].retransmits = 0;
+                            }
+                            break;
                         }
                     }
                 }
                 if (should_reinject) {
-                    //printf("attempting to send\n");
                     WinDivertHelperCalcChecksums(packet, packetLen, &addr, 0);
-                    //printf("%p %p %u\n", sendbuffer + sendlength, packet, packetLen);
-                    //printf("checksums calculated\n");
                     memcpy(sendbuffer + sendlength, packet, packetLen);
-                    //printf("packet written to buffer\n");
                     sendaddrs[nsendaddrs++] = addr;
-                    //printf("addr written\n");
                     sendlength += packetLen;
                 }
             }
@@ -2215,6 +2241,200 @@ void do_super_reverse_frag(HANDLE filter, WINDIVERT_ADDRESS *pAddr, struct super
     }
     //printf("Finish reverse\n");
 }
+enum outputtype {
+    i32,
+    ui32,
+    i16,
+    ui16
+};
+struct variability {
+    void* output;
+    enum outputtype outputtype;
+    unsigned int min;
+    unsigned int max;
+};
+unsigned int variabilitymaxlen = 0,
+             variabilitylen = 0;
+struct variability* variabilities = NULL;
+void add_variability(void* output, enum outputtype outputtype, unsigned int min, unsigned int max) {
+    if (variabilitylen == variabilitymaxlen)
+        variabilities = realloc(variabilities, (variabilitymaxlen + 4) * sizeof(struct variability));
+    variabilities[variabilitylen].output = output;
+    variabilities[variabilitylen].outputtype = outputtype;
+    variabilities[variabilitylen].min = min;
+    variabilities[variabilitylen++].max = max;
+}
+unsigned int atoui(char* str) {
+    unsigned int multiplier = 1,
+                 result = 0;
+    for (unsigned int i = strlen(str); i > 0; i--) {
+        if (str[i - 1] >= '0' && str[i - 1] <= '9') result += (str[i - 1] - '0') * multiplier;
+        else return 0;
+        multiplier *= 10;
+    }
+    return result;
+}
+bool process_number(char* str, void* output, enum outputtype outputtype) {
+    unsigned int length = strlen(str),
+                 colonpos = 0;
+    char negative = 0;
+    for (unsigned int i = 0; i < length; i++)
+        if (str[i] == ':') {
+            if (i == 0 || (i + 1 == length) || (i == 1 && str[0] == '-') || str[length - 1] == '-') {
+                printf("Invalid input string!\n");
+                return false;
+            }
+            colonpos = i;
+        }
+    unsigned int unsigned_output = 0, unsigned_multiplier = 1, min, max, i;
+    int signed_output = 0, signed_multiplier = 1;
+    switch (outputtype % 2) {
+        case 0:
+            if (colonpos != 0) {
+                if (str[0] == '-') {
+                    negative = 1;
+                    signed_multiplier *= -1;
+                }
+                for (i = colonpos; i > 0 + negative; i--) {
+                    if (str[i - 1] >= '0' && str[i - 1] <= '9') signed_output += (str[i - 1] - '0') * signed_multiplier;
+                    else {
+                        printf("Non-digit detected!\n");
+                        return false;
+                    }
+                    signed_multiplier *= 10;
+                }
+                if (outputtype == i32)
+                    min = signed_output;
+                else {
+                    if (signed_output > 32767) {
+                        printf("Overflow error!\n");
+                        return false;
+                    }
+                    if (signed_output < -32768) {
+                        printf("Underflow error!\n");
+                        return false;
+                    }
+                    min = signed_output;
+                }
+                signed_output = 0;
+                signed_multiplier = 1;
+                negative = 0;
+                if (str[colonpos + 1] == '-') {
+                    negative = 1;
+                    signed_multiplier *= -1;
+                }
+                for (i = length; i > colonpos + 1 + negative; i--) {
+                    if (str[i - 1] >= '0' && str[i - 1] <= '9') signed_output += (str[i - 1] - '0') * signed_multiplier;
+                    else {
+                        printf("Non-digit detected!\n");
+                        return false;
+                    }
+                    signed_multiplier *= 10;
+                }
+                if (outputtype == i32)
+                    max = signed_output;
+                else {
+                    if (signed_output > 32767) {
+                        printf("Overflow error!\n");
+                        return false;
+                    }
+                    if (signed_output < -32768) {
+                        printf("Underflow error!\n");
+                        return false;
+                    }
+                    max = signed_output;
+                }
+                if (min > max) {
+                    printf("Min is greater than max!");
+                    return false;
+                }
+                add_variability(output, outputtype, min, max);
+            }
+            else {
+                signed_output = atoi(str);
+                if (outputtype == i32)
+                    *((int*) output) = signed_output;
+                else {
+                    if (signed_output > 32767) {
+                        printf("Overflow error!\n");
+                        return false;
+                    }
+                    if (signed_output < -32768) {
+                        printf("Underflow error!\n");
+                        return false;
+                    }
+                    *((short*) output) = signed_output;
+                }
+            }
+            break;
+        case 1:
+            if (colonpos != 0) {
+                if (str[0] == '-' || str[colonpos + 1] == '-') {
+                    printf("Sign error!\n");
+                    return false;
+                }
+                for (i = colonpos; i > 0; i--) {
+                    if (str[i - 1] >= '0' && str[i - 1] <= '9') unsigned_output += (str[i - 1] - '0') * unsigned_multiplier;
+                    else {
+                        printf("Non-digit detected!\n");
+                        return false;
+                    }
+                    unsigned_multiplier *= 10;
+                }
+                if (outputtype == ui32)
+                    min = unsigned_output;
+                else {
+                    if (unsigned_output > 65535) {
+                        printf("Overflow error!\n");
+                        return false;
+                    }
+                    min = unsigned_output;
+                }
+                unsigned_output = 0;
+                unsigned_multiplier = 1;
+                for (i = length; i > colonpos + 1; i--) {
+                    if (str[i - 1] >= '0' && str[i - 1] <= '9') unsigned_output += (str[i - 1] - '0') * unsigned_multiplier;
+                    else {
+                        printf("Non-digit detected!\n");
+                        return false;
+                    }
+                    unsigned_multiplier *= 10;
+                }
+                if (outputtype == ui32)
+                    max = unsigned_output;
+                else {
+                    if (unsigned_output > 65535) {
+                        printf("Overflow error!\n");
+                        return false;
+                    }
+                    max = unsigned_output;
+                }
+                if (min > max) {
+                    printf("Min is greater than max!");
+                    return false;
+                }
+                add_variability(output, outputtype, min, max);
+            }
+            else {
+                if (str[0] == '-') {
+                    printf("Sign error!\n");
+                    return false;
+                }
+                if (outputtype == ui32)
+                    *((unsigned int*) output) = atoui(str);
+                else {
+                    unsigned_output = atoui(str);
+                    if (unsigned_output > 65535) {
+                        printf("Overflow error!\n");
+                        return false;
+                    }
+                    *((unsigned short*) output) = unsigned_output;
+                }
+            }
+            break;
+    }
+    return true;
+}
 int main(int argc, char *argv[]) {
     //hexbuff[2] = (char)0;
     reassemblePacket = calloc(MAX_PACKET_SIZE, sizeof(char));
@@ -2252,7 +2472,7 @@ int main(int argc, char *argv[]) {
     tcp_conntrack_info_t tcp_conn_info;
     FILE* fakes;
     char* lists[4] = {0};
-    unsigned int findmss = 0, fakebuilderrors = 0;
+    unsigned int findmss = 0, fakebuilderrors = 0, seed32 = 45;
     int do_passivedpi = 0, do_block_quic = 0,
         do_fragment_http = 0,
         do_fragment_http_persistent = 0,
@@ -2299,6 +2519,8 @@ int main(int argc, char *argv[]) {
     char *hdr_name_addr = NULL, *hdr_value_addr = NULL;
     unsigned int hdr_value_len;
     unsigned short randseed = time(NULL) % 0x10000;
+    unsigned int irandseed = time(NULL) % 0x100000000;
+    int sirandseed = (int) (time(NULL) % 0x100000000);
     printf("RANDOM SEED: %u\n", randseed);
     // Make sure to search DLLs only in safe path, not in current working dir.
     SetDllDirectory("");
@@ -2477,7 +2699,7 @@ int main(int argc, char *argv[]) {
                 }
                 break;
             case 'C': // --tls-recseg-size
-                tls_recseg_size = atousi(optarg, "(RECSEG) Fragment size should be in range [0 - 65535]\n");
+                process_number(optarg, &tls_recseg_size, ui16);
                 break;
             case '-': // --discord-vc
                 const char *tcp = " or (outbound and tcp and !impostor and !loopback " MAXPAYLOADSIZE_TEMPLATE " and " \
@@ -2714,7 +2936,7 @@ int main(int argc, char *argv[]) {
                 i = 0;
                 break;
             case 'I':
-                seq_offset = atoi(optarg);
+                process_number(optarg, &seq_offset, i32);
                 break;
             case 'A':
                 vortex_step_left = atousi(optarg, "Step bias should be in range [1 - 4]\n") > 0 ? atousi(optarg, "Step bias should be in range [1 - 4]\n") : 1;
@@ -2785,7 +3007,7 @@ int main(int argc, char *argv[]) {
                 do_tcp_verb = 1;
                 break;
             case 'O':
-                tls_absolute_frag = atousi(optarg, "(ABSOLUTE) Fragment size should be in range [0 - 65535]\n");
+                process_number(optarg, &tls_absolute_frag, ui16);
                 break;
             case '?':
                 drop_unsecure_dns = 1;
@@ -3167,7 +3389,7 @@ int main(int argc, char *argv[]) {
         /* IPv4 only filter for inbound RST packets with ID [0x0; 0xF] */
         add_filter(NULL,
             filter_passive_string,
-            WINDIVERT_FLAG_DROP, 1);
+            WINDIVERT_FLAG_DROP, 3);
 
     if (do_block_quic)
         add_filter(NULL,
@@ -3563,6 +3785,26 @@ int main(int argc, char *argv[]) {
                     current_fragment_size = 0;
                     fragmentInfo.length = 0;
                     if ((sni_fragment_size || tls_absolute_frag || tls_rando_frag) && sni_ok && packet_v4) {
+                        if (variabilities) {
+                            for (unsigned int i = 0; i < variabilitylen; i++) {
+                                switch (variabilities[i].outputtype) {
+                                    case i32:
+                                        *((int*)variabilities[i].output) = genrands32(sirandseed, variabilities[i].min, variabilities[i].max);
+                                        break;
+                                    case ui32:
+                                        *((unsigned int*)variabilities[i].output) = genrand32(irandseed, variabilities[i].min, variabilities[i].max);
+                                        break;
+                                    case i16:
+                                        *((short*)variabilities[i].output) = genrands32(sirandseed, variabilities[i].min, variabilities[i].max);
+                                        break;
+                                    case ui16:
+                                        *((unsigned short*)variabilities[i].output) = genrand32(irandseed, variabilities[i].min, variabilities[i].max);
+                                        break;
+                                }
+                            }
+                            sirandseed = genrands32(sirandseed, 0, 0);
+                            irandseed = genrand32(irandseed, 0, 0);
+                        }
                         tcpBaseSeq = ptrtouice(packet + hdrLen + 4);
                         progress = 0;
                         fakePacketLen = 0;
